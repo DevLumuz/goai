@@ -87,11 +87,17 @@
 | -------------- | -------------------------------------------------------------------------------------------------- |
 | **NVIDIA NIM** | New provider (OpenAI-compatible, chat + embeddings). E2E tested with `meta/llama-3.3-70b-instruct` |
 
-## v0.7.3 - Current release
+## v0.7.3
 
 | Feature                       | Description                                                                                                                                                                                                                       |
 | ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Reasoning text on results** | New `Reasoning` field on `TextResult`, `StepResult`, and `provider.GenerateResult`. Populated for both `GenerateText` and `StreamText` across Bedrock, Anthropic, OpenAI Responses, Google, Cohere, and OpenAI-compat (DeepSeek). |
+
+## v0.7.4 - Current release
+
+| Feature                       | Description                                                                                                                                                                                                          |
+| ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Azure v1 GA path fix**      | Drop the `api-version` query parameter on the v1 GA path (`/openai/v1{path}`) per Azure spec. Spec-strict resources rejected it with `"API version not supported"` (observed on gpt-5.5). Legacy deployment-based path still uses `api-version`; opt in via `WithDeploymentBasedURLs(true)` when an explicit dated version is required. |
 
 ### Planned
 
