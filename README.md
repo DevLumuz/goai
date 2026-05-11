@@ -53,6 +53,7 @@ Inspired by the [Vercel AI SDK](https://sdk.vercel.ai). The same clean abstracti
 - **20 provider-defined tools**: Web fetch, file search, image generation, X search, and more - [full list](#provider-defined-tools)
 - **MCP client**: Connect to any MCP server (stdio, HTTP, SSE), auto-convert tools for use with GoAI
 - **Observability**: Built-in Langfuse and OpenTelemetry (OTel) integrations for tracing generations, tools, and multi-step loops
+- **Multi-agent orchestration**: For declarative YAML workflows on top of GoAI, see [zenflow](https://github.com/zendev-sh/zenflow)
 - **9 lifecycle hooks**: Observability (`OnRequest`, `OnResponse`, `OnToolCallStart`, `OnToolCall`, `OnStepFinish`, `OnFinish`) and interceptor (`OnBeforeToolExecute`, `OnAfterToolExecute`, `OnBeforeStep`) hooks for permission gates, secret scanning, output transformation, and loop control
 - **Retry/backoff**: Automatic retry with exponential backoff on retryable HTTP errors (429/5xx)
 - **Minimal dependencies**: Core depends on `golang.org/x/oauth2` + one indirect (`cloud.google.com/go/compute/metadata`). Optional `observability/otel` submodule uses separate `go.mod` with OTel SDK.
@@ -247,6 +248,10 @@ result, _ := goai.GenerateText(ctx, model,
 ```
 
 See [examples/mcp-tools](examples/mcp-tools/) and the [MCP documentation](https://goai.sh/concepts/mcp) for more.
+
+## Companion Projects
+
+**[zenflow](https://github.com/zendev-sh/zenflow)** - multi-agent orchestration engine for Go. Declarative YAML workflows, typed inter-agent mailboxes, single static binary. Built on GoAI for the LLM layer; reach for it when one `MaxSteps` loop is no longer enough.
 
 ## Citations / Sources
 

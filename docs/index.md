@@ -36,6 +36,7 @@ Inspired by the [Vercel AI SDK](https://sdk.vercel.ai), GoAI is designed idiomat
 - **[MCP Client](/concepts/mcp)** — connect to any MCP server (stdio, HTTP, SSE), auto-convert tools for GoAI
 - **Prompt Caching** — automatic cache control for Anthropic and OpenAI
 - **[Observability](/concepts/observability)** — built-in Langfuse and OpenTelemetry integrations for tracing generations, tools, and multi-step loops
+- **Multi-agent orchestration** - for declarative YAML workflows on top of GoAI, see [zenflow](https://zenflow.sh)
 
 ## Why GoAI?
 
@@ -88,6 +89,10 @@ result, _ := goai.GenerateText(ctx, model,
 ```
 
 3 transports (stdio, HTTP, SSE), tools/prompts/resources, pagination, notifications. [Learn more →](/concepts/mcp)
+
+## Companion Projects
+
+**[zenflow](https://zenflow.sh)** - multi-agent orchestration engine for Go. Declarative YAML workflows, typed inter-agent mailboxes, single static binary. Built on GoAI for the LLM layer; reach for it when one `MaxSteps` loop is no longer enough.
 
 ## Supported Providers
 
