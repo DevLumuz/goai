@@ -6,53 +6,101 @@ package sse
 
 import (
 	"bufio"
+	"errors"
+	"fmt"
 	"io"
 	"strings"
 )
 
+// MaxLineSize is the upper bound on a single SSE line, in bytes.
+//
+// Large enough to comfortably hold long tool-call argument deltas and
+// reasoning blocks observed from production providers, while preventing a
+// malicious or buggy upstream from forcing unbounded client-side allocation
+// (a DoS vector). Lines exceeding this size cause Next to stop and Err to
+// report the violation.
+const MaxLineSize = 16 << 20 // 16 MiB
+
 // Scanner reads SSE data payloads from an io.Reader.
 type Scanner struct {
-	scanner *bufio.Scanner
-	done    bool
+	reader *bufio.Reader
+	err    error
+	done   bool
 }
 
-// NewScanner creates an SSE scanner with a 1MB buffer.
+// NewScanner creates an SSE scanner backed by a bufio.Reader.
+//
+// Lines up to [MaxLineSize] bytes are accepted; longer lines cause the
+// scanner to stop with an error reported via Err. This lifts the 1 MiB
+// limit imposed by bufio.Scanner while still bounding memory use.
 func NewScanner(r io.Reader) *Scanner {
-	s := bufio.NewScanner(r)
-	s.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	return &Scanner{scanner: s}
+	return &Scanner{reader: bufio.NewReader(r)}
 }
 
 // Next returns the next SSE data payload (with "data: " prefix stripped).
 // Returns ("", false) at EOF or after [DONE].
 // Skips non-"data: " lines and blank lines.
 func (s *Scanner) Next() (data string, ok bool) {
-	if s.done {
+	if s.done || s.err != nil {
 		return "", false
 	}
 
-	for s.scanner.Scan() {
-		line := s.scanner.Text()
-		if !strings.HasPrefix(line, "data:") {
-			continue
+	for {
+		line, err := s.readLine()
+		if len(line) > 0 {
+			line = strings.TrimRight(line, "\r\n")
+			if strings.HasPrefix(line, "data:") {
+				payload := strings.TrimPrefix(strings.TrimPrefix(line, "data:"), " ")
+				if payload == "[DONE]" {
+					s.done = true
+					return "", false
+				}
+				return payload, true
+			}
+			// Non-"data:" line: skip and continue reading.
 		}
-		data = strings.TrimPrefix(line, "data:")
-		data = strings.TrimPrefix(data, " ")
 
-		if data == "[DONE]" {
-			s.done = true
+		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				s.err = err
+			}
 			return "", false
 		}
-
-		return data, true
 	}
-
-	return "", false
 }
 
-// Err returns the first non-EOF error encountered by the scanner.
+// readLine reads one '\n'-terminated line, accumulating across the
+// underlying bufio.Reader's internal buffer so we are not limited by its
+// size. It enforces [MaxLineSize] to prevent unbounded memory growth from
+// a hostile or malformed stream.
+//
+// Returns the line (which may include the trailing '\n') together with
+// any terminal error. A final partial line at EOF is returned with
+// io.EOF.
+func (s *Scanner) readLine() (string, error) {
+	var buf []byte
+	for {
+		slice, err := s.reader.ReadSlice('\n')
+		if len(buf)+len(slice) > MaxLineSize {
+			return "", fmt.Errorf("sse: line exceeds %d bytes", MaxLineSize)
+		}
+		// ReadSlice returns a reference into the reader's internal buffer
+		// that may be overwritten on the next read; append copies it out.
+		buf = append(buf, slice...)
+		if err == nil {
+			return string(buf), nil
+		}
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue
+		}
+		return string(buf), err
+	}
+}
+
+// Err returns the first non-EOF error encountered while reading,
+// including line-size violations.
 func (s *Scanner) Err() error {
-	return s.scanner.Err()
+	return s.err
 }
 
 // IsDone reports whether the scanner has encountered the [DONE] sentinel.
