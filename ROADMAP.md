@@ -124,11 +124,17 @@
 | **SSE scanner accepts large lines**   | `internal/sse` swaps `bufio.Scanner` (1 MiB cap) for a `bufio.Reader`-based scanner so long tool-call argument deltas and reasoning blocks no longer fail with `bufio.Scanner: token too long`. A 16 MiB `MaxLineSize` cap prevents unbounded allocation from a hostile stream. (#73)                                       |
 | **DeepSeek thinking-mode round-trip** | `internal/openaicompat` echoes `reasoning_content` back on assistant messages so DeepSeek thinking-mode survives multi-turn conversations instead of dropping the prior chain-of-thought. (#72)                                                                                                                            |
 
-## v0.7.9 - Current release
+## v0.7.9
 
 | Feature                                       | Description                                                                                                                                                                                                                                                                                                          |
 | --------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **OpenAI Responses API large SSE lines**     | `provider/openai` Responses streaming swaps its local `bufio.Scanner` (1 MiB cap) for the `internal/sse` scanner via a new `NextLine` method, so very long `output_text.delta` and reasoning events no longer fail with `bufio.Scanner: token too long`. Completes the fix from #73 for the Responses code path. (#75) |
+
+## v0.7.10 - Current release
+
+| Feature                                          | Description                                                                                                                                                                                                                                                                                                                                                                       |
+| ------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **MCP HTTPTransport: POST-only Streamable HTTP** | `mcp.HTTPTransport.Start` now treats `405` (or `404`) on the optional GET-for-SSE channel as "no server-initiated stream" per the MCP Streamable HTTP spec (2025-03-26), so POST-only servers (Zoho MCP and others) work instead of failing with `mcp: SSE connection failed: HTTP 405`. Inline JSON-RPC and `text/event-stream` POST responses are still dispatched as before. (#76) |
 
 ### Planned
 
