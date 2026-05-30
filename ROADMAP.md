@@ -130,7 +130,13 @@
 | --------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **OpenAI Responses API large SSE lines**     | `provider/openai` Responses streaming swaps its local `bufio.Scanner` (1 MiB cap) for the `internal/sse` scanner via a new `NextLine` method, so very long `output_text.delta` and reasoning events no longer fail with `bufio.Scanner: token too long`. Completes the fix from #73 for the Responses code path. (#75) |
 
-## v0.7.10 - Current release
+## v0.7.11 - Current release
+
+| Feature                          | Description                                                                                                                          |
+| -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| **llama.cpp server provider**    | New `provider/llamacpp` package for connecting to llama.cpp server (OpenAI-compatible API at `http://localhost:8080`). Chat + Embedding support. (#77) |
+
+## v0.7.10
 
 | Feature                                          | Description                                                                                                                                                                                                                                                                                                                                                                       |
 | ------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
