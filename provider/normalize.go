@@ -1,5 +1,7 @@
 package provider
 
+import "slices"
+
 // NormalizeToolMessages prepares messages for providers that require:
 // 1. Every assistant tool-call has a matching tool-result (orphan fix)
 // 2. Alternating user/assistant roles (merge consecutive same-role)
@@ -20,20 +22,21 @@ func NormalizeToolMessages(msgs []Message) []Message {
 // ProviderOptions["resultBlock"], so no following tool-result message is
 // expected.
 func ensureToolResultPairing(msgs []Message) []Message {
+	msgs = cloneMessages(msgs)
 	for i := 0; i < len(msgs); i++ {
 		if msgs[i].Role != RoleAssistant {
 			continue
 		}
-		var callIDs []string
+		var toolCalls []Part
 		for _, p := range msgs[i].Content {
 			if p.Type == PartToolCall && p.ToolCallID != "" {
 				if _, hasInlineResult := p.ProviderOptions["resultBlock"]; hasInlineResult {
 					continue
 				}
-				callIDs = append(callIDs, p.ToolCallID)
+				toolCalls = append(toolCalls, p)
 			}
 		}
-		if len(callIDs) == 0 {
+		if len(toolCalls) == 0 {
 			continue
 		}
 		// Scan all consecutive tool/user messages after assistant
@@ -50,12 +53,13 @@ func ensureToolResultPairing(msgs []Message) []Message {
 			}
 		}
 		var orphans []Part
-		for _, id := range callIDs {
-			if !resultIDs[id] {
+		for _, toolCall := range toolCalls {
+			if !resultIDs[toolCall.ToolCallID] {
 				orphans = append(orphans, Part{
 					Type:       PartToolResult,
-					ToolCallID: id,
+					ToolCallID: toolCall.ToolCallID,
 					ToolOutput: "Tool execution aborted",
+					ToolName:   toolCall.ToolName,
 				})
 			}
 		}
@@ -72,6 +76,21 @@ func ensureToolResultPairing(msgs []Message) []Message {
 		}
 	}
 	return msgs
+}
+
+func cloneMessages(msgs []Message) []Message {
+	if len(msgs) == 0 {
+		return msgs
+	}
+	out := make([]Message, len(msgs))
+	for i, msg := range msgs {
+		// Copy the whole struct (preserving ProviderOptions and any future
+		// fields), then clone the Content slice, which is the only part this
+		// package appends to.
+		out[i] = msg
+		out[i].Content = slices.Clone(msg.Content)
+	}
+	return out
 }
 
 // mergeConsecutiveRoles merges consecutive messages with the same role.
