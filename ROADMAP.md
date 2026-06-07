@@ -130,7 +130,7 @@
 | --------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **OpenAI Responses API large SSE lines**     | `provider/openai` Responses streaming swaps its local `bufio.Scanner` (1 MiB cap) for the `internal/sse` scanner via a new `NextLine` method, so very long `output_text.delta` and reasoning events no longer fail with `bufio.Scanner: token too long`. Completes the fix from #73 for the Responses code path. (#75) |
 
-## v0.7.11 - Current release
+## v0.7.11
 
 | Feature                          | Description                                                                                                                          |
 | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
@@ -141,6 +141,15 @@
 | Feature                                          | Description                                                                                                                                                                                                                                                                                                                                                                       |
 | ------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **MCP HTTPTransport: POST-only Streamable HTTP** | `mcp.HTTPTransport.Start` now treats `405` (or `404`) on the optional GET-for-SSE channel as "no server-initiated stream" per the MCP Streamable HTTP spec (2025-03-26), so POST-only servers (Zoho MCP and others) work instead of failing with `mcp: SSE connection failed: HTTP 405`. Inline JSON-RPC and `text/event-stream` POST responses are still dispatched as before. (#76) |
+
+## v0.8.0 - Current release
+
+| Feature                              | Description                                                                                                                                                                                                                                                                                                                          |
+| ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **MCP OAuth 2.1 + PKCE**             | Native OAuth 2.1 authorization with PKCE for remote MCP servers: `mcp.NewOAuthTokenSource`, `mcp.NewOAuthHTTPClient`, and a pluggable `TokenStore` (`mcp.NewMemoryTokenStore`) handle the authorization-code + refresh flow so HTTP/SSE transports can talk to auth-protected MCP servers. See `examples/mcp-oauth`. Contributed by @DevLumuz. (#80) |
+| **Hook & predicate panics surface (breaking)** | Panics in lifecycle hooks (`OnRequest`, `OnResponse`, `OnStepFinish`, `OnFinish`, `OnBeforeStep`) and the `StopWhen` predicate are no longer swallowed to stderr. They are surfaced as a `*PanicError` (returned by `GenerateText`/`GenerateObject`, or via `stream.Err()` for `StreamText`/`StreamObject`) and reported to a new `WithOnPanic` observability hook. The tool path (tool `Execute`, tool hooks) stays resilient, converting panics to tool errors. Code relying on the old swallow-and-continue behavior must register `OnPanic` or stop panicking in hooks. (#82) |
+| **`NewTool` typed constructor**      | `goai.NewTool[In](name, description, execute)` builds a `Tool` from a typed input struct: the JSON Schema is generated via `SchemaFrom` and the model's arguments are unmarshaled into `In` before `execute` runs, so callers no longer hand-write JSON Schema or unmarshal input. The raw `goai.Tool` struct form remains for hand-written schemas and provider-defined tools. (#83) |
+| **Smaller module**                   | Removed compiled example binaries (~34 MB) accidentally committed to the repo root; a pre-commit hook now blocks committing compiled executables. `go get` no longer downloads them. (#81) |
 
 ### Planned
 
