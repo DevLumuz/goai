@@ -18,6 +18,51 @@ func (e *ContextOverflowError) Error() string {
 	return e.Message
 }
 
+// PanicError wraps a value recovered from a panic in a user-provided callback
+// (a lifecycle hook or the StopWhen predicate). It is returned by GenerateText
+// and GenerateObject, and surfaced through stream.Err() for StreamText and
+// StreamObject, so callers can intercept callback panics programmatically
+// instead of having them swallowed.
+//
+// Panics inside the tool path (tool Execute, OnToolCallStart, OnToolCall,
+// OnBeforeToolExecute, OnAfterToolExecute) are NOT wrapped in a PanicError:
+// they keep their resilient behavior (converted to a tool error, the agent
+// loop continues). They are still reported to any OnPanic hook.
+//
+// Value and Stack may contain sensitive data (panic arguments, captured
+// variables, credentials). They are deliberately NOT included in Error() so a
+// logged error string cannot leak them; access the fields explicitly and
+// sanitize before logging or exporting.
+type PanicError struct {
+	// Phase identifies the callback that panicked, e.g. "OnStepFinish",
+	// "OnFinish", "OnResponse", "OnRequest", "OnBeforeStep", "StopWhen".
+	Phase string
+
+	// Value is the value passed to panic(). May contain sensitive data; see the
+	// type doc. Not included in Error().
+	Value any
+
+	// Stack is the goroutine stack captured at the recovery point. May contain
+	// sensitive data; see the type doc. Not included in Error().
+	Stack []byte
+}
+
+// Error returns a message identifying the phase only. The panic value is
+// intentionally omitted to avoid leaking sensitive data into logged error
+// strings; read Value/Unwrap for the underlying cause.
+func (e *PanicError) Error() string {
+	return fmt.Sprintf("goai: panic in %s", e.Phase)
+}
+
+// Unwrap returns the panic value if it is itself an error, enabling
+// errors.Is/errors.As against the original cause; otherwise it returns nil.
+func (e *PanicError) Unwrap() error {
+	if err, ok := e.Value.(error); ok {
+		return err
+	}
+	return nil
+}
+
 // APIError represents a non-overflow API error.
 type APIError struct {
 	Message         string
