@@ -142,7 +142,13 @@
 | ------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **MCP HTTPTransport: POST-only Streamable HTTP** | `mcp.HTTPTransport.Start` now treats `405` (or `404`) on the optional GET-for-SSE channel as "no server-initiated stream" per the MCP Streamable HTTP spec (2025-03-26), so POST-only servers (Zoho MCP and others) work instead of failing with `mcp: SSE connection failed: HTTP 405`. Inline JSON-RPC and `text/event-stream` POST responses are still dispatched as before. (#76) |
 
-## v0.8.1 - Current release
+## v0.8.2 - Current release
+
+| Feature                                       | Description                                                                                                                                                                                                                                                                                                                          |
+| --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Tool name on synthetic orphan results**     | `provider.NormalizeToolMessages` now copies `ToolName` onto the synthetic "Tool execution aborted" results it injects for orphaned tool calls, so consumers that normalize before the Google provider no longer hit `functionResponse.name: Name cannot be empty`. The normalization is now copy-on-input (no longer mutates the caller's messages or `Content`/`ProviderOptions`). Contributed by @nehmeroumani. (#90) |
+
+## v0.8.1
 
 | Feature                                       | Description                                                                                                                                                                                                                                                                                                                          |
 | --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
