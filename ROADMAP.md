@@ -142,7 +142,13 @@
 | ------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **MCP HTTPTransport: POST-only Streamable HTTP** | `mcp.HTTPTransport.Start` now treats `405` (or `404`) on the optional GET-for-SSE channel as "no server-initiated stream" per the MCP Streamable HTTP spec (2025-03-26), so POST-only servers (Zoho MCP and others) work instead of failing with `mcp: SSE connection failed: HTTP 405`. Inline JSON-RPC and `text/event-stream` POST responses are still dispatched as before. (#76) |
 
-## v0.8.0 - Current release
+## v0.8.1 - Current release
+
+| Feature                                       | Description                                                                                                                                                                                                                                                                                                                          |
+| --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **OpenAI Responses API rate-limit errors**    | Streaming `error` events from the Responses API are now parsed for both the documented flat shape and the nested `error.{code,message}` shape OpenAI returns in production, with per-field fallback so partial nested objects do not drop the flat detail. Rate-limit (`rate_limit_exceeded`) errors are classified as retryable 429s so the provider's retry logic kicks in instead of surfacing a generic non-retryable error. Applies to OpenAI Responses mode and Azure. Contributed by @nehmeroumani. (#88, #89) |
+
+## v0.8.0
 
 | Feature                              | Description                                                                                                                                                                                                                                                                                                                          |
 | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
