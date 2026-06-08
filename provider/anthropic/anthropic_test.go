@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/zendev-sh/goai"
 	"github.com/zendev-sh/goai/internal/httpc"
@@ -223,6 +224,85 @@ func TestChat_Stream_Reasoning(t *testing.T) {
 	}
 	if chunks[1].Type != provider.ChunkText || chunks[1].Text != "The answer is 42" {
 		t.Errorf("chunks[1] = %+v, want text", chunks[1])
+	}
+}
+
+func TestChat_Stream_RedactedThinking(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, `data: {"type":"message_start","message":{"usage":{"input_tokens":10}}}`+"\n\n")
+		// Redacted thinking arrives as a complete block in content_block_start (no deltas).
+		_, _ = fmt.Fprint(w, `data: {"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"encrypted-blob-xyz"}}`+"\n\n")
+		_, _ = fmt.Fprint(w, `data: {"type":"content_block_stop","index":0}`+"\n\n")
+		_, _ = fmt.Fprint(w, `data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}`+"\n\n")
+		_, _ = fmt.Fprint(w, `data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"The answer is 42"}}`+"\n\n")
+		_, _ = fmt.Fprint(w, `data: {"type":"content_block_stop","index":1}`+"\n\n")
+		_, _ = fmt.Fprint(w, `data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":20}}`+"\n\n")
+		_, _ = fmt.Fprint(w, `data: {"type":"message_stop"}`+"\n\n")
+	}))
+	defer server.Close()
+
+	model := Chat("claude-sonnet-4-20250514", WithAPIKey("test-key"), WithBaseURL(server.URL))
+	result, err := model.DoStream(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "think about this"}}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var chunks []provider.StreamChunk
+	for chunk := range result.Stream {
+		chunks = append(chunks, chunk)
+	}
+
+	// The redacted_thinking block must surface as a ChunkReasoning carrying the
+	// encrypted data so it can be replayed on a later turn.
+	var redacted *provider.StreamChunk
+	for i := range chunks {
+		if chunks[i].Type == provider.ChunkReasoning {
+			redacted = &chunks[i]
+			break
+		}
+	}
+	if redacted == nil {
+		t.Fatalf("expected a reasoning chunk for redacted thinking, got %+v", chunks)
+	}
+	if redacted.Text != "" {
+		t.Errorf("redacted reasoning chunk text = %q, want empty", redacted.Text)
+	}
+	if data, _ := redacted.Metadata["redactedData"].(string); data != "encrypted-blob-xyz" {
+		t.Errorf("redactedData = %v, want encrypted-blob-xyz", redacted.Metadata["redactedData"])
+	}
+}
+
+func TestParseSSE_RedactedThinking_ContextCancelled(t *testing.T) {
+	// With a cancelled context and an unbuffered channel that has no reader,
+	// TrySend must take the ctx.Done() branch and parseSSE must return without
+	// blocking. Covers the cancellation path of the redacted_thinking case.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	out := make(chan provider.StreamChunk)
+	body := strings.NewReader(`data: {"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"encrypted-blob"}}` + "\n\n")
+
+	done := make(chan struct{})
+	go func() {
+		parseSSE(ctx, body, out, false)
+		close(done)
+	}()
+
+	// With no reader, the unbuffered send is never ready, so TrySend must take
+	// the cancelled-ctx branch and parseSSE must return (and close out).
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("parseSSE did not return after context cancellation")
+	}
+
+	// out is closed now; draining must complete without yielding a chunk.
+	for chunk := range out {
+		t.Errorf("expected no chunk after cancellation, got %+v", chunk)
 	}
 }
 
@@ -1009,6 +1089,27 @@ func TestBuildRequest_ThinkingAdaptive(t *testing.T) {
 	}
 	if _, hasBudget := thinking["budget_tokens"]; hasBudget {
 		t.Error("adaptive thinking should not have budget_tokens")
+	}
+}
+
+func TestBuildRequest_ThinkingAdaptiveDisplay(t *testing.T) {
+	m := &chatModel{id: "claude-opus-4-8", opts: options{baseURL: defaultBaseURL}}
+	body := m.buildRequest(provider.GenerateParams{
+		Messages: []provider.Message{{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}}},
+		ProviderOptions: map[string]any{
+			"thinking": map[string]any{"type": "adaptive", "display": "summarized"},
+		},
+	}, true)
+
+	thinking, ok := body["thinking"].(map[string]any)
+	if !ok {
+		t.Fatal("thinking not in request body")
+	}
+	if thinking["type"] != "adaptive" {
+		t.Errorf("thinking.type = %v, want adaptive", thinking["type"])
+	}
+	if thinking["display"] != "summarized" {
+		t.Errorf("thinking.display = %v, want summarized", thinking["display"])
 	}
 }
 

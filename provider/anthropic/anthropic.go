@@ -362,6 +362,9 @@ func (m *chatModel) buildRequest(params provider.GenerateParams, streaming bool)
 	// Thinking / extended thinking.
 	// Read from ProviderOptions["thinking"] -- matches Vercel AI SDK convention.
 	// Accepts: {type: "enabled", budgetTokens: N} or {type: "adaptive"} or {type: "disabled"}.
+	// Adaptive thinking accepts an optional display: "summarized" | "omitted"
+	// (Opus 4.7/4.8 default to "omitted", so thinking text streams empty unless
+	// "summarized" is requested).
 	if thinking, ok := params.ProviderOptions["thinking"]; ok {
 		if tm, ok := thinking.(map[string]any); ok {
 			thinkingReq := map[string]any{}
@@ -370,6 +373,9 @@ func (m *chatModel) buildRequest(params provider.GenerateParams, streaming bool)
 			}
 			if budget, ok := tm["budgetTokens"]; ok {
 				thinkingReq["budget_tokens"] = budget
+			}
+			if display, ok := tm["display"]; ok {
+				thinkingReq["display"] = display
 			}
 			if len(thinkingReq) > 0 {
 				body["thinking"] = thinkingReq
@@ -888,6 +894,21 @@ func parseSSE(ctx context.Context, body io.Reader, out chan<- provider.StreamChu
 						ToolName:   currentToolName,
 					}) {
 						return
+					}
+				case "redacted_thinking":
+					// Redacted thinking arrives as a complete block in
+					// content_block_start (no deltas). Surface the encrypted
+					// data so it can be replayed on the next turn.
+					if data, _ := cb["data"].(string); data != "" {
+						if !provider.TrySend(ctx, out, provider.StreamChunk{
+							Type: provider.ChunkReasoning,
+							Text: "",
+							Metadata: map[string]any{
+								"redactedData": data,
+							},
+						}) {
+							return
+						}
 					}
 				default:
 					if isServerToolResultBlock(cbType) {
