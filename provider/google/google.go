@@ -616,9 +616,10 @@ func parseSSE(ctx context.Context, body io.Reader, out chan<- provider.StreamChu
 				usage.InputTokens = 0
 			}
 			usage.ReasoningTokens = resp.UsageMetadata.ThoughtsTokenCount
-			// candidatesTokenCount son los tokens visibles de salida; thoughtsTokenCount
-			// va aparte (totalTokenCount = prompt + candidates + thoughts). NO restar:
-			// con thinking pesado thoughts > candidates y el output caía a 0.
+			// candidatesTokenCount is the visible output; thoughtsTokenCount is
+			// reported separately (totalTokenCount = prompt + candidates + thoughts).
+			// Do not subtract it: under heavy thinking thoughts > candidates and the
+			// output count fell to 0.
 			usage.OutputTokens = resp.UsageMetadata.CandidatesTokenCount
 		}
 
@@ -799,8 +800,8 @@ func parseResponse(body []byte) (*provider.GenerateResult, error) {
 			result.Usage.InputTokens = 0
 		}
 		result.Usage.ReasoningTokens = resp.UsageMetadata.ThoughtsTokenCount
-		// Ver nota en el path de streaming: output = candidatesTokenCount (sin restar
-		// thoughts, que van aparte en thoughtsTokenCount).
+		// See the note in the streaming path: output = candidatesTokenCount (without
+		// subtracting thoughts, which are reported separately in thoughtsTokenCount).
 		result.Usage.OutputTokens = resp.UsageMetadata.CandidatesTokenCount
 		result.Usage.TotalTokens = result.Usage.InputTokens + result.Usage.OutputTokens + result.Usage.ReasoningTokens
 	}

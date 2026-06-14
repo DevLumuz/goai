@@ -1251,8 +1251,8 @@ func TestChat_Stream_NegativeTokens(t *testing.T) {
 
 	for chunk := range result.Stream {
 		if chunk.Type == provider.ChunkFinish {
-			// InputTokens sigue clampeado a 0 (prompt 5 - cache 10). OutputTokens =
-			// candidatesTokenCount (2), sin restar thoughts.
+			// InputTokens stays clamped to 0 (prompt 5 - cache 10). OutputTokens =
+			// candidatesTokenCount (2), without subtracting thoughts.
 			if chunk.Usage.InputTokens != 0 {
 				t.Errorf("InputTokens = %d, want 0", chunk.Usage.InputTokens)
 			}
