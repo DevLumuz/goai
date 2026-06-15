@@ -52,6 +52,16 @@ var Tools = struct {
 	// CodeExecution_20250825 creates a code execution tool (version 20250825).
 	// Requires beta header: code-execution-2025-08-25.
 	CodeExecution_20250825 func() provider.ToolDefinition
+
+	// ToolSearchToolRegex creates the regex tool search tool (version 20251119).
+	// Claude searches the deferred tool catalog with Python re.search() patterns.
+	// Pair it with defer_loading:true on the tools that should load on demand.
+	ToolSearchToolRegex func() provider.ToolDefinition
+
+	// ToolSearchToolBM25 creates the BM25 tool search tool (version 20251119).
+	// Claude searches the deferred tool catalog with natural-language queries.
+	// Pair it with defer_loading:true on the tools that should load on demand.
+	ToolSearchToolBM25 func() provider.ToolDefinition
 }{
 	Computer: func(opts ComputerToolOptions) provider.ToolDefinition {
 		return computerTool(opts, "computer_20250124")
@@ -72,6 +82,12 @@ var Tools = struct {
 	},
 	CodeExecution_20250825: func() provider.ToolDefinition {
 		return codeExecutionTool("code_execution_20250825")
+	},
+	ToolSearchToolRegex: func() provider.ToolDefinition {
+		return toolSearchTool("tool_search_tool_regex", "tool_search_tool_regex_20251119")
+	},
+	ToolSearchToolBM25: func() provider.ToolDefinition {
+		return toolSearchTool("tool_search_tool_bm25", "tool_search_tool_bm25_20251119")
 	},
 }
 
@@ -194,10 +210,10 @@ func textEditor20250728Tool(opts ...TextEditorOption) provider.ToolDefinition {
 type WebSearchOption func(*webSearchConfig)
 
 type webSearchConfig struct {
-	MaxUses        int                 // max number of searches per turn
-	AllowedDomains []string            // restrict search to these domains
-	BlockedDomains []string            // exclude these domains from search
-	UserLocation   *WebSearchLocation  // optional user location
+	MaxUses        int                // max number of searches per turn
+	AllowedDomains []string           // restrict search to these domains
+	BlockedDomains []string           // exclude these domains from search
+	UserLocation   *WebSearchLocation // optional user location
 }
 
 // WebSearchLocation provides geographically relevant search results.
@@ -372,6 +388,20 @@ func codeExecutionTool(version string) provider.ToolDefinition {
 }
 
 // ---------------------------------------------------------------------------
+// ToolSearch
+// ---------------------------------------------------------------------------
+
+// toolSearchTool builds a tool search server tool (regex or bm25). The search
+// tool itself must never be deferred; pair it with defer_loading:true on the
+// custom tools that should be discovered on demand.
+func toolSearchTool(name, version string) provider.ToolDefinition {
+	return provider.ToolDefinition{
+		Name:                name,
+		ProviderDefinedType: version,
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Beta header helpers
 // ---------------------------------------------------------------------------
 
@@ -443,6 +473,11 @@ func convertToolToAPI(t provider.ToolDefinition) map[string]any {
 		if err := json.Unmarshal(t.InputSchema, &schema); err == nil {
 			tool["input_schema"] = schema
 		}
+	}
+	// Deferred tools are omitted from the initial tool set and surfaced only
+	// when the model discovers them through a tool search tool.
+	if t.DeferLoading {
+		tool["defer_loading"] = true
 	}
 	return tool
 }
