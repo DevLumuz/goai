@@ -34,10 +34,10 @@ var (
 )
 
 const (
-	defaultBaseURL    = "https://api.anthropic.com"
-	apiVersion        = "2023-06-01"
-	betaFeatures      = "claude-code-20250219,interleaved-thinking-2025-05-14"
-	defaultMaxTokens  = 16384
+	defaultBaseURL   = "https://api.anthropic.com"
+	apiVersion       = "2023-06-01"
+	betaFeatures     = "claude-code-20250219,interleaved-thinking-2025-05-14"
+	defaultMaxTokens = 16384
 )
 
 // anthropicHandledKeys lists provider option keys that are explicitly handled
@@ -1204,12 +1204,13 @@ func mapFinishReason(reason string) provider.FinishReason {
 // assistant turn -- omitting them causes the API to reject re-sent transcripts
 // with "tool_use ids were found without `tool_result` blocks".
 var serverToolResultBlockTypes = map[string]bool{
-	"web_search_tool_result":                true,
-	"web_fetch_tool_result":                 true,
-	"code_execution_tool_result":            true,
-	"bash_code_execution_tool_result":       true,
+	"web_search_tool_result":                 true,
+	"web_fetch_tool_result":                  true,
+	"code_execution_tool_result":             true,
+	"bash_code_execution_tool_result":        true,
 	"text_editor_code_execution_tool_result": true,
-	"mcp_tool_result":                       true,
+	"mcp_tool_result":                        true,
+	"tool_search_tool_result":                true,
 }
 
 func isServerToolResultBlock(t string) bool {
@@ -1229,7 +1230,7 @@ func parseResponse(body []byte) (*provider.GenerateResult, error) {
 			Input     json.RawMessage `json:"input,omitempty"`
 			Thinking  string          `json:"thinking,omitempty"`
 			Signature string          `json:"signature,omitempty"`
-			Data      string          `json:"data,omitempty"` // redacted_thinking
+			Data      string          `json:"data,omitempty"`        // redacted_thinking
 			ToolUseID string          `json:"tool_use_id,omitempty"` // for server tool result blocks
 			Citations []struct {
 				Type            string  `json:"type"`

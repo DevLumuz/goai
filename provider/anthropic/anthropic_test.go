@@ -3063,6 +3063,58 @@ func TestChat_Generate_ServerToolResultRoundTrip(t *testing.T) {
 	}
 }
 
+// TestChat_Generate_ToolSearchResultRoundTrip verifies that the built-in tool
+// search server tool (server_tool_use + tool_search_tool_result) is captured
+// into the matching ToolCall.Metadata so it survives a multi-turn round-trip,
+// like web_search and the other server-executed tool results. Unlike those,
+// the tool_search_tool_result content is an object (not an array), which the
+// verbatim round-trip must preserve unchanged.
+func TestChat_Generate_ToolSearchResultRoundTrip(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{
+			"id": "msg_ts1",
+			"model": "sonnet-test-model",
+			"type": "message",
+			"content": [
+				{"type": "server_tool_use", "id": "srvtoolu_ts", "name": "tool_search_tool_regex", "input": {"query": "weather"}},
+				{"type": "tool_search_tool_result", "tool_use_id": "srvtoolu_ts", "content": {"type": "tool_search_tool_search_result", "tool_references": [{"type": "tool_reference", "tool_name": "get_weather"}]}}
+			],
+			"stop_reason": "tool_use",
+			"usage": {"input_tokens": 20, "output_tokens": 15}
+		}`)
+	}))
+	defer server.Close()
+
+	model := Chat("sonnet-test-model", WithAPIKey("test-key"), WithBaseURL(server.URL))
+	result, err := model.DoGenerate(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "weather in SF?"}}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(result.ToolCalls) != 1 {
+		t.Fatalf("ToolCalls = %d, want 1", len(result.ToolCalls))
+	}
+	tc := result.ToolCalls[0]
+	if tc.ID != "srvtoolu_ts" || tc.Name != "tool_search_tool_regex" {
+		t.Errorf("ToolCall = %+v, want srvtoolu_ts/tool_search_tool_regex", tc)
+	}
+	rb, ok := tc.Metadata["resultBlock"].(map[string]any)
+	if !ok {
+		t.Fatalf("ToolCall.Metadata[resultBlock] missing or wrong type: %T", tc.Metadata["resultBlock"])
+	}
+	if rb["type"] != "tool_search_tool_result" {
+		t.Errorf("resultBlock type = %v, want tool_search_tool_result", rb["type"])
+	}
+	if rb["tool_use_id"] != "srvtoolu_ts" {
+		t.Errorf("resultBlock tool_use_id = %v, want srvtoolu_ts", rb["tool_use_id"])
+	}
+}
+
 // TestChat_Stream_ServerToolResultRoundTrip is the streaming counterpart to
 // TestChat_Generate_ServerToolResultRoundTrip.
 func TestChat_Stream_ServerToolResultRoundTrip(t *testing.T) {

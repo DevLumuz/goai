@@ -206,6 +206,26 @@ func TestTools_CodeExecution20250825(t *testing.T) {
 	}
 }
 
+func TestTools_ToolSearchToolRegex(t *testing.T) {
+	tool := Tools.ToolSearchToolRegex()
+	if tool.Name != "tool_search_tool_regex" {
+		t.Errorf("Name = %q, want tool_search_tool_regex", tool.Name)
+	}
+	if tool.ProviderDefinedType != "tool_search_tool_regex_20251119" {
+		t.Errorf("ProviderDefinedType = %q, want tool_search_tool_regex_20251119", tool.ProviderDefinedType)
+	}
+}
+
+func TestTools_ToolSearchToolBM25(t *testing.T) {
+	tool := Tools.ToolSearchToolBM25()
+	if tool.Name != "tool_search_tool_bm25" {
+		t.Errorf("Name = %q, want tool_search_tool_bm25", tool.Name)
+	}
+	if tool.ProviderDefinedType != "tool_search_tool_bm25_20251119" {
+		t.Errorf("ProviderDefinedType = %q, want tool_search_tool_bm25_20251119", tool.ProviderDefinedType)
+	}
+}
+
 func TestBetaForTool(t *testing.T) {
 	tests := []struct {
 		toolType string
@@ -224,6 +244,8 @@ func TestBetaForTool(t *testing.T) {
 		{"code_execution_20260120", ""},
 		{"web_search_20260209", "code-execution-web-tools-2026-02-09"},
 		{"web_fetch_20260209", "code-execution-web-tools-2026-02-09"},
+		{"tool_search_tool_regex_20251119", ""}, // GA, no beta header
+		{"tool_search_tool_bm25_20251119", ""},  // GA, no beta header
 		{"unknown_tool", ""},
 		{"", ""},
 	}
@@ -265,8 +287,8 @@ func TestCollectToolBetas_Mixed(t *testing.T) {
 
 func TestCollectToolBetas_CodeExecution(t *testing.T) {
 	tools := []provider.ToolDefinition{
-		Tools.CodeExecution(),           // 20260120 → no beta
-		Tools.CodeExecution_20250825(),  // 20250825 → beta
+		Tools.CodeExecution(),          // 20260120 → no beta
+		Tools.CodeExecution_20250825(), // 20250825 → beta
 	}
 
 	betas := collectToolBetas(tools)
@@ -346,6 +368,38 @@ func TestConvertToolToAPI_Regular(t *testing.T) {
 	}
 	if api["input_schema"] == nil {
 		t.Error("regular tool should have input_schema")
+	}
+}
+
+func TestConvertToolToAPI_DeferLoading(t *testing.T) {
+	tool := provider.ToolDefinition{
+		Name:         "get_weather",
+		Description:  "Get the weather",
+		InputSchema:  json.RawMessage(`{"type":"object"}`),
+		DeferLoading: true,
+	}
+
+	api := convertToolToAPI(tool)
+
+	if api["defer_loading"] != true {
+		t.Errorf("defer_loading = %v, want true", api["defer_loading"])
+	}
+	if api["name"] != "get_weather" {
+		t.Errorf("name = %v, want get_weather", api["name"])
+	}
+}
+
+func TestConvertToolToAPI_NoDeferLoadingByDefault(t *testing.T) {
+	tool := provider.ToolDefinition{
+		Name:        "get_weather",
+		Description: "Get the weather",
+	}
+
+	api := convertToolToAPI(tool)
+
+	// Backward-compatible: absent unless explicitly deferred.
+	if _, ok := api["defer_loading"]; ok {
+		t.Error("defer_loading should be absent when DeferLoading is false")
 	}
 }
 

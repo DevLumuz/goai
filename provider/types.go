@@ -387,6 +387,13 @@ type ToolDefinition struct {
 	// ProviderDefinedOptions holds provider-specific tool configuration
 	// (e.g. displayWidthPx for computer use). Providers interpret these as needed.
 	ProviderDefinedOptions map[string]any
+
+	// DeferLoading marks a tool for on-demand loading: it is omitted from the
+	// initial tool set and surfaced only once the model discovers it through a
+	// tool search tool. Providers that support deferred tool loading (Anthropic)
+	// translate it to their wire flag; others ignore it. Has no effect unless a
+	// tool search tool is also present in the request.
+	DeferLoading bool
 }
 
 // ToolCall represents the model's request to invoke a tool.

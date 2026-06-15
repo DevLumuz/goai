@@ -28,6 +28,11 @@ type Tool struct {
 	// (e.g. displayWidthPx for computer use).
 	ProviderDefinedOptions map[string]any
 
+	// DeferLoading marks this tool for on-demand loading via a tool search tool
+	// (see provider.ToolDefinition.DeferLoading). The zero value keeps the tool
+	// loaded upfront.
+	DeferLoading bool
+
 	// Execute runs the tool with the given JSON input and returns the result text.
 	// Both the return value and error string are forwarded to the model as a tool
 	// result message. Do not include sensitive data (credentials, internal paths)
