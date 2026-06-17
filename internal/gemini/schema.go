@@ -11,10 +11,11 @@ import (
 const maxRefInlineDepth = 10
 
 // SanitizeSchema sanitizes a JSON Schema for Gemini compatibility.
-// It converts enum integer/number types to string, filters invalid required fields,
-// ensures array items have a type, inlines $ref/$defs (which Gemini rejects),
-// and strips JSON Schema conditionals (if/then/else) which Gemini's OpenAPI
-// validator does not understand.
+// It converts enum integer/number types to string, rewrites "const" to a
+// single-value "enum" (Gemini rejects "const"), filters invalid required
+// fields, ensures array items have a type, inlines $ref/$defs (which Gemini
+// rejects), and strips JSON Schema conditionals (if/then/else) which Gemini's
+// OpenAPI validator does not understand.
 func SanitizeSchema(schema map[string]any) map[string]any {
 	// Step 1: resolve $ref → $defs and strip unsupported keywords.
 	// Gemini's function_declarations validator cannot resolve
@@ -160,6 +161,19 @@ func sanitizeImpl(obj any) any {
 				result[k] = strEnum
 				continue
 			}
+		}
+		// Gemini's schema has no "const" (common in MCP tool schemas and
+		// discriminated unions); express it as a single-value "enum", which it
+		// supports. Check the source map for "enum" so iteration order doesn't
+		// matter, and supply a string type when none is present.
+		if k == "const" {
+			if _, hasEnum := m["enum"]; !hasEnum {
+				result["enum"] = []any{fmt.Sprint(v)}
+				if _, hasType := m["type"]; !hasType {
+					result["type"] = "string"
+				}
+			}
+			continue
 		}
 
 		switch vv := v.(type) {

@@ -763,3 +763,38 @@ func TestSanitizeSchema_NoInputMutation_AnySlice(t *testing.T) {
 		t.Error("result should have nullable: true")
 	}
 }
+
+func TestSanitizeSchema_ConstBecomesEnum(t *testing.T) {
+	// Gemini rejects "const"; it must become a single-value "enum". A typed
+	// const keeps its type; an untyped const gets a synthesized string type.
+	schema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"kind":    map[string]any{"type": "string", "const": "create"},
+			"untyped": map[string]any{"const": "x"},
+		},
+	}
+	props, ok := SanitizeSchema(schema)["properties"].(map[string]any)
+	if !ok {
+		t.Fatal("properties missing")
+	}
+
+	kind := props["kind"].(map[string]any)
+	if _, has := kind["const"]; has {
+		t.Error("const should be removed")
+	}
+	if !reflect.DeepEqual(kind["enum"], []any{"create"}) {
+		t.Errorf("kind enum = %v, want [create]", kind["enum"])
+	}
+	if kind["type"] != "string" {
+		t.Errorf("kind type = %v, want string", kind["type"])
+	}
+
+	untyped := props["untyped"].(map[string]any)
+	if !reflect.DeepEqual(untyped["enum"], []any{"x"}) {
+		t.Errorf("untyped enum = %v, want [x]", untyped["enum"])
+	}
+	if untyped["type"] != "string" {
+		t.Errorf("untyped type = %v, want synthesized string", untyped["type"])
+	}
+}
