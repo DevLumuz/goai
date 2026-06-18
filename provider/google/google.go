@@ -300,6 +300,15 @@ func (m *chatModel) buildRequest(params provider.GenerateParams) (geminiRequestB
 		}
 	}
 
+	// toolConfig from ProviderOptions (flat key, not under google namespace).
+	// Used for Gemini 3.x include_server_side_tool_invocations and other
+	// root-level toolConfig fields.
+	if tc, ok := params.ProviderOptions["toolConfig"].(map[string]any); ok {
+		for k, v := range tc {
+			toolConfig[k] = v
+		}
+	}
+
 	if len(toolConfig) > 0 {
 		body.ToolConfig = toolConfig
 	}
