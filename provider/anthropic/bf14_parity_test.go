@@ -669,9 +669,9 @@ func TestBuildRequest_ContextManagement(t *testing.T) {
 						"trigger": map[string]any{"type": "input_tokens", "value": float64(100000)},
 					},
 					map[string]any{
-						"type":             "compact_20260112",
+						"type":                 "compact_20260112",
 						"pauseAfterCompaction": true,
-						"instructions":     "Keep key facts",
+						"instructions":         "Keep key facts",
 					},
 				},
 			},
@@ -741,16 +741,16 @@ func TestBuildRequest_HandledKeysNotPassthrough(t *testing.T) {
 	body := model.buildRequest(provider.GenerateParams{
 		Messages: []provider.Message{{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}}},
 		ProviderOptions: map[string]any{
-			"thinking":              map[string]any{"type": "enabled", "budgetTokens": 1024},
+			"thinking":               map[string]any{"type": "enabled", "budgetTokens": 1024},
 			"disableParallelToolUse": true,
-			"effort":                "high",
-			"speed":                 "fast",
-			"container":             map[string]any{"id": "c1"},
-			"contextManagement":     map[string]any{"edits": []any{}},
-			"structuredOutputMode":  "jsonTool",
-			"sendReasoning":         true,
-			"cacheControl":          map[string]any{"type": "ephemeral"},
-			"customPassthrough":     "should-appear",
+			"effort":                 "high",
+			"speed":                  "fast",
+			"container":              map[string]any{"id": "c1"},
+			"contextManagement":      map[string]any{"edits": []any{}},
+			"structuredOutputMode":   "jsonTool",
+			"sendReasoning":          true,
+			"cacheControl":           map[string]any{"type": "ephemeral"},
+			"customPassthrough":      "should-appear",
 		},
 	}, false)
 

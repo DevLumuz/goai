@@ -307,7 +307,7 @@ func (m *chatModel) buildRequest(params provider.GenerateParams, streaming bool)
 	if params.System != "" {
 		systemPart := map[string]any{"type": "text", "text": params.System}
 		if params.PromptCaching {
-			systemPart["cache_control"] = map[string]any{"type": "ephemeral"}
+			systemPart["cache_control"] = ephemeralCacheControl(params.CacheTTL)
 		}
 		body["system"] = []map[string]any{systemPart}
 	}
@@ -554,7 +554,7 @@ func convertMessages(msgs []provider.Message) []map[string]any {
 					continue
 				}
 				p := map[string]any{"type": "text", "text": part.Text}
-				applyCacheControl(p, part.CacheControl, msgCacheControl, isLast)
+				applyCacheControl(p, part.CacheControl, part.CacheControlTTL, msgCacheControl, isLast)
 				content = append(content, p)
 
 			case provider.PartReasoning:
@@ -569,7 +569,7 @@ func convertMessages(msgs []provider.Message) []map[string]any {
 						continue
 					}
 					p := map[string]any{"type": "thinking", "thinking": part.Text, "signature": sig}
-					applyCacheControl(p, part.CacheControl, msgCacheControl, isLast)
+					applyCacheControl(p, part.CacheControl, part.CacheControlTTL, msgCacheControl, isLast)
 					content = append(content, p)
 				} else if part.ProviderOptions != nil {
 					// Redacted thinking (no text, just encrypted data).
@@ -595,7 +595,7 @@ func convertMessages(msgs []provider.Message) []map[string]any {
 						"data":       data,
 					},
 				}
-				applyCacheControl(p, part.CacheControl, msgCacheControl, isLast)
+				applyCacheControl(p, part.CacheControl, part.CacheControlTTL, msgCacheControl, isLast)
 				content = append(content, p)
 
 			case provider.PartFile:
@@ -614,7 +614,7 @@ func convertMessages(msgs []provider.Message) []map[string]any {
 						"data":       data,
 					},
 				}
-				applyCacheControl(p, part.CacheControl, msgCacheControl, isLast)
+				applyCacheControl(p, part.CacheControl, part.CacheControlTTL, msgCacheControl, isLast)
 				content = append(content, p)
 
 			case provider.PartToolCall:
@@ -643,11 +643,11 @@ func convertMessages(msgs []provider.Message) []map[string]any {
 					"input": input,
 				}
 				if resultBlock == nil {
-					applyCacheControl(p, part.CacheControl, msgCacheControl, isLast)
+					applyCacheControl(p, part.CacheControl, part.CacheControlTTL, msgCacheControl, isLast)
 				}
 				content = append(content, p)
 				if resultBlock != nil {
-					applyCacheControl(resultBlock, part.CacheControl, msgCacheControl, isLast)
+					applyCacheControl(resultBlock, part.CacheControl, part.CacheControlTTL, msgCacheControl, isLast)
 					content = append(content, resultBlock)
 				}
 
@@ -657,7 +657,7 @@ func convertMessages(msgs []provider.Message) []map[string]any {
 					"tool_use_id": part.ToolCallID,
 					"content":     part.ToolOutput,
 				}
-				applyCacheControl(p, part.CacheControl, msgCacheControl, isLast)
+				applyCacheControl(p, part.CacheControl, part.CacheControlTTL, msgCacheControl, isLast)
 				content = append(content, p)
 			}
 		}
@@ -684,11 +684,27 @@ func convertMessages(msgs []provider.Message) []map[string]any {
 	return result
 }
 
+// ephemeralCacheControl builds an ephemeral cache_control marker, attaching the
+// TTL ("5m"/"1h") when non-empty. Empty TTL preserves the Anthropic default (5m).
+// 1h needs no beta header (GA).
+func ephemeralCacheControl(ttl string) map[string]any {
+	cc := map[string]any{"type": "ephemeral"}
+	if ttl != "" {
+		cc["ttl"] = ttl
+	}
+	return cc
+}
+
 // applyCacheControl adds cache_control to a content part.
 // Part-level CacheControl takes precedence; message-level only applies to the last part.
-func applyCacheControl(p map[string]any, partCC string, msgCC map[string]any, isLast bool) {
+// partTTL ("5m"/"1h") is attached to the part-level ephemeral marker; empty = default 5m.
+func applyCacheControl(p map[string]any, partCC, partTTL string, msgCC map[string]any, isLast bool) {
 	if partCC != "" {
-		p["cache_control"] = map[string]any{"type": partCC}
+		cc := map[string]any{"type": partCC}
+		if partTTL != "" {
+			cc["ttl"] = partTTL
+		}
+		p["cache_control"] = cc
 	} else if msgCC != nil && isLast {
 		p["cache_control"] = msgCC
 	}

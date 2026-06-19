@@ -639,6 +639,7 @@ func buildParams(opts options) provider.GenerateParams {
 		Headers:          maps.Clone(opts.Headers),
 		ProviderOptions:  maps.Clone(opts.ProviderOptions),
 		PromptCaching:    opts.PromptCaching,
+		CacheTTL:         opts.CacheTTL,
 		ToolChoice:       opts.ToolChoice,
 	}
 }

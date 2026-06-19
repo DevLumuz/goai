@@ -552,6 +552,60 @@ func TestBuildRequest_SystemCacheControl(t *testing.T) {
 	if cc["type"] != "ephemeral" {
 		t.Errorf("cache_control = %v, want ephemeral", cc)
 	}
+	if _, hasTTL := cc["ttl"]; hasTTL {
+		t.Errorf("cache_control should omit ttl by default, got %v", cc)
+	}
+}
+
+func TestBuildRequest_SystemCacheControlTTL(t *testing.T) {
+	m := &chatModel{id: "claude-sonnet-4-20250514", opts: options{baseURL: defaultBaseURL}}
+	body := m.buildRequest(provider.GenerateParams{
+		System: "You are helpful.",
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}},
+		},
+		PromptCaching: true,
+		CacheTTL:      "1h",
+	}, true)
+
+	system := body["system"].([]map[string]any)
+	cc, _ := system[0]["cache_control"].(map[string]any)
+	if cc["type"] != "ephemeral" {
+		t.Errorf("cache_control.type = %v, want ephemeral", cc["type"])
+	}
+	if cc["ttl"] != "1h" {
+		t.Errorf("cache_control.ttl = %v, want 1h", cc["ttl"])
+	}
+}
+
+func TestConvertMessages_PartLevelCacheTTL(t *testing.T) {
+	msgs := convertMessages([]provider.Message{
+		{
+			Role:    provider.RoleUser,
+			Content: []provider.Part{{Type: provider.PartText, Text: "hi", CacheControl: "ephemeral", CacheControlTTL: "1h"}},
+		},
+	})
+
+	content := msgs[0]["content"].([]map[string]any)
+	cc := content[0]["cache_control"].(map[string]any)
+	if cc["type"] != "ephemeral" {
+		t.Errorf("cache_control.type = %v, want ephemeral", cc["type"])
+	}
+	if cc["ttl"] != "1h" {
+		t.Errorf("cache_control.ttl = %v, want 1h", cc["ttl"])
+	}
+
+	// Empty TTL must omit the ttl key (default 5m behavior preserved).
+	msgs = convertMessages([]provider.Message{
+		{
+			Role:    provider.RoleUser,
+			Content: []provider.Part{{Type: provider.PartText, Text: "hi", CacheControl: "ephemeral"}},
+		},
+	})
+	cc = msgs[0]["content"].([]map[string]any)[0]["cache_control"].(map[string]any)
+	if _, hasTTL := cc["ttl"]; hasTTL {
+		t.Errorf("empty TTL should omit ttl key, got %v", cc)
+	}
 }
 
 func TestBuildRequest_Tools(t *testing.T) {
