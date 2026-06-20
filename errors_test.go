@@ -170,6 +170,16 @@ func TestParseStreamError(t *testing.T) {
 			`{"type":"error","error":{"code":"unknown_code","message":"something"}}`,
 			nil,
 		},
+		{
+			"embedded error - LM Studio",
+			`{"error":{"message":"Compute error."},"message":"Compute error."}`,
+			&ParsedStreamError{Type: "api_error", Message: "Compute error."},
+		},
+		{
+			"embedded error - context overflow",
+			`{"error":{"message":"input length greater than the context length"}}`,
+			&ParsedStreamError{Type: "context_overflow", Message: "input length greater than the context length"},
+		},
 	}
 
 	for _, tt := range tests {
@@ -396,6 +406,12 @@ func TestClassifyStreamError(t *testing.T) {
 			name:    "nil for unknown code",
 			body:    `{"type":"error","error":{"code":"unknown","message":"nope"}}`,
 			wantNil: true,
+		},
+		{
+			name:     "embedded error - LM Studio",
+			body:     `{"error":{"message":"Compute error."},"message":"Compute error."}`,
+			wantType: "api",
+			wantMsg:  "Compute error.",
 		},
 	}
 	for _, tt := range tests {

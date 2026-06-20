@@ -129,45 +129,65 @@ func ParseStreamError(body []byte) *ParsedStreamError {
 	if err := json.Unmarshal(body, &obj); err != nil {
 		return nil
 	}
-	if obj.Type != "error" {
+
+	if obj.Type == "error" {
+		switch obj.Error.Code {
+		case "context_length_exceeded":
+			return &ParsedStreamError{
+				Type:         StreamErrorContextOverflow,
+				Message:      "Input exceeds context window of this model",
+				ResponseBody: string(body),
+			}
+		case "insufficient_quota":
+			return &ParsedStreamError{
+				Type:         StreamErrorAPI,
+				Message:      "Quota exceeded. Check your plan and billing details.",
+				IsRetryable:  false,
+				ResponseBody: string(body),
+			}
+		case "usage_not_included":
+			return &ParsedStreamError{
+				Type:         StreamErrorAPI,
+				Message:      "To use Codex with your ChatGPT plan, upgrade to Plus.",
+				IsRetryable:  false,
+				ResponseBody: string(body),
+			}
+		case "invalid_prompt":
+			msg := "Invalid prompt."
+			if obj.Error.Message != "" {
+				msg = obj.Error.Message
+			}
+			return &ParsedStreamError{
+				Type:         StreamErrorAPI,
+				Message:      msg,
+				IsRetryable:  false,
+				ResponseBody: string(body),
+			}
+		}
 		return nil
 	}
 
-	switch obj.Error.Code {
-	case "context_length_exceeded":
-		return &ParsedStreamError{
-			Type:         StreamErrorContextOverflow,
-			Message:      "Input exceeds context window of this model",
-			ResponseBody: string(body),
-		}
-	case "insufficient_quota":
-		return &ParsedStreamError{
-			Type:         StreamErrorAPI,
-			Message:      "Quota exceeded. Check your plan and billing details.",
-			IsRetryable:  false,
-			ResponseBody: string(body),
-		}
-	case "usage_not_included":
-		return &ParsedStreamError{
-			Type:         StreamErrorAPI,
-			Message:      "To use Codex with your ChatGPT plan, upgrade to Plus.",
-			IsRetryable:  false,
-			ResponseBody: string(body),
-		}
-	case "invalid_prompt":
-		msg := "Invalid prompt."
-		if obj.Error.Message != "" {
-			msg = obj.Error.Message
-		}
-		return &ParsedStreamError{
-			Type:         StreamErrorAPI,
-			Message:      msg,
-			IsRetryable:  false,
-			ResponseBody: string(body),
-		}
+	// Embedded error objects without type:"error" (LM Studio, llama.cpp server, etc.).
+	if obj.Error.Message != "" {
+		return streamErrorFromMessage(obj.Error.Message, body)
 	}
 
 	return nil
+}
+
+func streamErrorFromMessage(message string, body []byte) *ParsedStreamError {
+	if IsOverflow(message) {
+		return &ParsedStreamError{
+			Type:         StreamErrorContextOverflow,
+			Message:      message,
+			ResponseBody: string(body),
+		}
+	}
+	return &ParsedStreamError{
+		Type:         StreamErrorAPI,
+		Message:      message,
+		ResponseBody: string(body),
+	}
 }
 
 // ClassifyStreamError parses a stream error event and returns the appropriate

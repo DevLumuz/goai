@@ -3,11 +3,13 @@ package openaicompat
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
 	"testing"
 
+	"github.com/zendev-sh/goai"
 	"github.com/zendev-sh/goai/internal/sse"
 	"github.com/zendev-sh/goai/provider"
 )
@@ -630,6 +632,33 @@ data: [DONE]
 	for chunk := range out {
 		// Accept any chunk type - the key assertion is that the goroutine didn't leak.
 		_ = chunk
+	}
+}
+
+func TestParseStream_EmbeddedStreamError(t *testing.T) {
+	input := `data: {"error":{"message":"Compute error."},"message":"Compute error."}
+`
+	scanner := sse.NewScanner(strings.NewReader(input))
+	out := make(chan provider.StreamChunk, 10)
+	go ParseStream(t.Context(), scanner, out)
+
+	var chunks []provider.StreamChunk
+	for chunk := range out {
+		chunks = append(chunks, chunk)
+	}
+
+	if len(chunks) != 1 {
+		t.Fatalf("got %d chunks, want 1", len(chunks))
+	}
+	if chunks[0].Type != provider.ChunkError {
+		t.Errorf("type = %v, want error", chunks[0].Type)
+	}
+	var apiErr *goai.APIError
+	if !errors.As(chunks[0].Error, &apiErr) {
+		t.Fatalf("expected APIError, got %T", chunks[0].Error)
+	}
+	if apiErr.Message != "Compute error." {
+		t.Errorf("message = %q, want %q", apiErr.Message, "Compute error.")
 	}
 }
 
