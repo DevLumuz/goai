@@ -1,6 +1,6 @@
 # GoAI Roadmap
 
-> Last updated: 2026-04-19
+> Last updated: 2026-06-21
 
 ## v0.4.4
 
@@ -142,7 +142,25 @@
 | ------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **MCP HTTPTransport: POST-only Streamable HTTP** | `mcp.HTTPTransport.Start` now treats `405` (or `404`) on the optional GET-for-SSE channel as "no server-initiated stream" per the MCP Streamable HTTP spec (2025-03-26), so POST-only servers (Zoho MCP and others) work instead of failing with `mcp: SSE connection failed: HTTP 405`. Inline JSON-RPC and `text/event-stream` POST responses are still dispatched as before. (#76) |
 
-## v0.8.3 - Current release
+## v0.8.5 - Current release
+
+| Feature                             | Description                                                                                                                                                                                                                                                                            |
+| ----------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Requesty provider**               | New `provider/requesty` package for the [Requesty](https://requesty.ai) OpenAI-compatible LLM gateway. `provider/model` model naming, `/chat/completions` at `https://router.requesty.ai/v1`, optional HTTP-Referer / X-Title analytics headers. Built on `internal/openaicompat`. (#106) |
+| **Reasoning on stepResult**         | The per-step `Reasoning` field is now populated on `StepResult` inside the multi-step tool loop, not just on the final `TextResult`. (#103)                                                                                                                                            |
+| **Anthropic native structured output** | `GenerateObject` / `StreamObject` against Anthropic now send the schema via the native `output_config.format` field instead of a tool, matching the Messages API structured-output contract. (#105)                                                                                |
+| **Gemini schema sanitization**      | The Gemini schema sanitizer now strips `propertyNames`, `patternProperties`, `const`, `exclusiveMinimum`/`exclusiveMaximum`, and `default`, which the Google/Vertex API rejects. (#108)                                                                                                |
+| **MCP CallTool empty arguments**    | `mcp` `CallTool` now sends `arguments` as `{}` instead of omitting the field, for servers that require the key to be present. (#107, #109)                                                                                                                                             |
+
+## v0.8.4
+
+| Feature                             | Description                                                                                                                                                                                                                                                                                                              |
+| ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **RetryObserver**                   | New `WithRetryObserver` option registers a callback fired before each retry attempt with the 0-based attempt number, the triggering error, and the delay before the next attempt. Threaded through `GenerateText`, `StreamText`, `GenerateObject`, `StreamObject`, `Embed`, and `EmbedMany`, so retries can be logged or observed. (#95, #98) |
+| **Split tool-call stream metadata** | Streaming tool calls whose argument payload is split across multiple upstream chunks now preserve their metadata (id, name) instead of dropping it when the fragments are reassembled. (#96)                                                                                                                              |
+| **Anthropic redacted_thinking**     | The Anthropic streaming parser now captures `redacted_thinking` blocks so encrypted reasoning is round-tripped back on the assistant turn instead of being silently dropped. (#94)                                                                                                                                       |
+
+## v0.8.3
 
 | Feature                           | Description                                                                                                                                                                                                                                                                                                                                                                                          |
 | --------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
