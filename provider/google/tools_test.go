@@ -212,3 +212,51 @@ func TestSnakeToCamel(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// ComputerUse
+// ---------------------------------------------------------------------------
+
+func TestTools_ComputerUse_Default(t *testing.T) {
+	def := Tools.ComputerUse()
+	if def.Name != "computer_use" {
+		t.Errorf("Name = %q, want computer_use", def.Name)
+	}
+	if def.ProviderDefinedType != "google.computer_use" {
+		t.Errorf("ProviderDefinedType = %q, want google.computer_use", def.ProviderDefinedType)
+	}
+	if len(def.ProviderDefinedOptions) != 0 {
+		t.Errorf("expected empty options, got %v", def.ProviderDefinedOptions)
+	}
+}
+
+func TestTools_ComputerUse_Options(t *testing.T) {
+	def := Tools.ComputerUse(
+		WithEnvironment("ENVIRONMENT_BROWSER"),
+		WithExcludedFunctions("open_web_browser", "search"),
+	)
+	opts := def.ProviderDefinedOptions
+	if opts["environment"] != "ENVIRONMENT_BROWSER" {
+		t.Errorf("environment = %v, want ENVIRONMENT_BROWSER", opts["environment"])
+	}
+	excluded, ok := opts["excludedPredefinedFunctions"].([]string)
+	if !ok {
+		t.Fatalf("excludedPredefinedFunctions = %T, want []string", opts["excludedPredefinedFunctions"])
+	}
+	if len(excluded) != 2 || excluded[0] != "open_web_browser" || excluded[1] != "search" {
+		t.Errorf("excludedPredefinedFunctions = %v", excluded)
+	}
+}
+
+// The tool reaches the wire under its camelCased key, with the options nested
+// inside it -- the shape the API expects.
+func TestTools_ComputerUse_WireShape(t *testing.T) {
+	wire := googleProviderTool(Tools.ComputerUse(WithEnvironment("ENVIRONMENT_BROWSER")))
+	inner, ok := wire["computerUse"].(map[string]any)
+	if !ok {
+		t.Fatalf("wire = %v, want a computerUse key", wire)
+	}
+	if inner["environment"] != "ENVIRONMENT_BROWSER" {
+		t.Errorf("computerUse.environment = %v", inner["environment"])
+	}
+}
