@@ -26,10 +26,19 @@ var Tools = struct {
 	// use the output to formulate its response.
 	// Requires Gemini 2.0+.
 	CodeExecution func() provider.ToolDefinition
+
+	// ComputerUse enables Gemini's computer use tool: the model sees screenshots
+	// and emits UI actions (click, type, scroll, …) that the client executes,
+	// returning a fresh screenshot. Client-executed: each action arrives as a
+	// regular functionCall and its result goes back as a functionResponse.
+	// The Gemini 3.x family has it built-in (just add the tool); 2.5 needs the
+	// dedicated gemini-2.5-computer-use-preview model.
+	ComputerUse func(opts ...ComputerUseOption) provider.ToolDefinition
 }{
 	GoogleSearch:  googleSearchTool,
 	URLContext:    urlContextTool,
 	CodeExecution: codeExecutionTool,
+	ComputerUse:   computerUseTool,
 }
 
 // ---------------------------------------------------------------------------
@@ -118,6 +127,57 @@ func codeExecutionTool() provider.ToolDefinition {
 	return provider.ToolDefinition{
 		Name:                "code_execution",
 		ProviderDefinedType: "google.code_execution",
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ComputerUse
+// ---------------------------------------------------------------------------
+
+// ComputerUseOption configures the computer use tool.
+type ComputerUseOption func(*computerUseConfig)
+
+type computerUseConfig struct {
+	// Environment is the target surface enum the model controls (e.g. the
+	// browser or the full desktop). Passed through verbatim to the wire; the
+	// caller owns the exact enum string the API expects.
+	Environment string
+	// ExcludedPredefinedFunctions lists built-in action names to disable, so the
+	// model never emits them (e.g. omit navigation in a kiosk).
+	ExcludedPredefinedFunctions []string
+}
+
+// WithEnvironment sets the computer use environment (the surface the model
+// controls). The value is the API enum string and is sent unchanged.
+func WithEnvironment(env string) ComputerUseOption {
+	return func(c *computerUseConfig) { c.Environment = env }
+}
+
+// WithExcludedFunctions disables specific predefined actions for this session.
+func WithExcludedFunctions(fns ...string) ComputerUseOption {
+	return func(c *computerUseConfig) { c.ExcludedPredefinedFunctions = fns }
+}
+
+func computerUseTool(opts ...ComputerUseOption) provider.ToolDefinition {
+	cfg := &computerUseConfig{}
+	for _, o := range opts {
+		o(cfg)
+	}
+
+	providerOpts := map[string]any{}
+	if cfg.Environment != "" {
+		providerOpts["environment"] = cfg.Environment
+	}
+	if len(cfg.ExcludedPredefinedFunctions) > 0 {
+		providerOpts["excludedPredefinedFunctions"] = cfg.ExcludedPredefinedFunctions
+	}
+
+	// googleProviderTool camelCases "google.computer_use" -> "computerUse" and
+	// nests providerOpts under it: {"computerUse": {"environment": "..."}}.
+	return provider.ToolDefinition{
+		Name:                   "computer_use",
+		ProviderDefinedType:    "google.computer_use",
+		ProviderDefinedOptions: providerOpts,
 	}
 }
 
