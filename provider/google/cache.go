@@ -1,0 +1,178 @@
+package google
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/zendev-sh/goai/provider"
+)
+
+// CacheClient creates and manages Gemini explicit context-caching resources
+// (cachedContents). It reuses the same auth, endpoint routing and tool
+// serialization as chat requests (see buildToolsAndConfig), so a cached prefix
+// is byte-identical to what a generate request would otherwise send — there is
+// no second, drifting serialization of system/tools/toolConfig.
+//
+// A cachedContents resource stores only the immutable prefix
+// (model + systemInstruction + tools + toolConfig). The conversation history is
+// never part of it: it travels in each request's contents and references the
+// resource by name via the cachedContent field.
+type CacheClient struct {
+	opts options
+}
+
+// NewCacheClient builds a CacheClient. It accepts the same options as Chat
+// (WithAPIKey/WithTokenSource/WithVertex/WithBaseURL/...) so caching
+// authenticates and routes exactly like generation for the same credentials.
+func NewCacheClient(opts ...Option) *CacheClient {
+	return &CacheClient{opts: resolveOptions(opts...)}
+}
+
+// CachedContentInput is the immutable prefix to store. ToolChoice and
+// ProviderOptions are serialized identically to a generate request so the cached
+// toolConfig matches; History is intentionally absent (it is never cached).
+type CachedContentInput struct {
+	Model           string
+	System          string
+	Tools           []provider.ToolDefinition
+	ToolChoice      string
+	ProviderOptions map[string]any
+	TTL             time.Duration
+}
+
+// CachedContent identifies a stored resource and when the provider will expire
+// it. Name is the resource name to pass back as the cachedContent of a request
+// (and to Renew): "cachedContents/<id>" on the direct API, or the full
+// "projects/.../cachedContents/<id>" path on Vertex.
+type CachedContent struct {
+	Name      string
+	ExpiresAt time.Time
+}
+
+// Create stores a new cachedContents resource and returns its name + expiry.
+func (c *CacheClient) Create(ctx context.Context, in CachedContentInput) (CachedContent, error) {
+	tools, toolConfig, err := buildToolsAndConfig(in.Tools, in.ToolChoice, in.ProviderOptions)
+	if err != nil {
+		return CachedContent{}, err
+	}
+
+	body := map[string]any{
+		"model": cacheModelName(c.opts, in.Model),
+		"ttl":   fmt.Sprintf("%ds", int(in.TTL.Seconds())),
+	}
+	if si := buildSystemInstruction(in.System); si != nil {
+		body["systemInstruction"] = si
+	}
+	if tools != nil {
+		body["tools"] = tools
+	}
+	if toolConfig != nil {
+		body["toolConfig"] = toolConfig
+	}
+
+	reqURL, err := c.createURL()
+	if err != nil {
+		return CachedContent{}, err
+	}
+	return c.send(ctx, http.MethodPost, reqURL, body)
+}
+
+// Renew extends the TTL of an existing resource via PATCH and returns the new
+// expiry. name is the value returned by Create.
+func (c *CacheClient) Renew(ctx context.Context, name string, ttl time.Duration) (CachedContent, error) {
+	reqURL, err := c.resourceURL(name, "?updateMask=ttl")
+	if err != nil {
+		return CachedContent{}, err
+	}
+	body := map[string]any{"ttl": fmt.Sprintf("%ds", int(ttl.Seconds()))}
+	return c.send(ctx, http.MethodPatch, reqURL, body)
+}
+
+func (c *CacheClient) send(ctx context.Context, method, url string, body any) (CachedContent, error) {
+	resp, err := doGoogleJSON(ctx, c.opts, method, url, body, nil)
+	if err != nil {
+		return CachedContent{}, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return CachedContent{}, fmt.Errorf("reading cachedContents response: %w", err)
+	}
+	var out struct {
+		Name       string `json:"name"`
+		ExpireTime string `json:"expireTime"`
+	}
+	if uerr := json.Unmarshal(data, &out); uerr != nil {
+		return CachedContent{}, fmt.Errorf("parsing cachedContents response: %w", uerr)
+	}
+	if out.Name == "" {
+		return CachedContent{}, fmt.Errorf("cachedContents response missing name: %s", string(data))
+	}
+	expires, err := time.Parse(time.RFC3339, out.ExpireTime)
+	if err != nil {
+		return CachedContent{}, fmt.Errorf("parsing cachedContents expireTime %q: %w", out.ExpireTime, err)
+	}
+	return CachedContent{Name: out.Name, ExpiresAt: expires}, nil
+}
+
+// cacheModelName is the model reference accepted in the cachedContents body:
+// the bare "models/<id>" on the direct API, or the fully-qualified publisher
+// path on Vertex.
+func cacheModelName(o options, modelID string) string {
+	if o.isVertex {
+		return fmt.Sprintf("projects/%s/locations/%s/publishers/google/models/%s", o.project, o.location, modelID)
+	}
+	return "models/" + modelID
+}
+
+// createURL is the collection endpoint for POSTing a new resource.
+func (c *CacheClient) createURL() (string, error) {
+	if !c.opts.isVertex {
+		return cacheBaseURL(c.opts) + "/cachedContents", nil
+	}
+	if err := validateVertex(c.opts); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%s/projects/%s/locations/%s/cachedContents", cacheBaseURL(c.opts), c.opts.project, c.opts.location), nil
+}
+
+// resourceURL is the item endpoint for an existing resource (PATCH/GET/DELETE).
+// name is the resource name returned by Create.
+func (c *CacheClient) resourceURL(name, query string) (string, error) {
+	if c.opts.isVertex {
+		if err := validateVertex(c.opts); err != nil {
+			return "", err
+		}
+	}
+	return cacheBaseURL(c.opts) + "/" + name + query, nil
+}
+
+// cacheBaseURL is the versioned API root for cachedContents. A WithBaseURL
+// override wins (testing/proxy), in Vertex mode too.
+func cacheBaseURL(o options) string {
+	if o.isVertex {
+		if base := strings.TrimRight(o.baseURL, "/"); base != defaultBaseURL && base != "" {
+			return base + "/v1beta1"
+		}
+		return "https://" + vertexHost(o.location) + "/v1beta1"
+	}
+	return strings.TrimRight(o.baseURL, "/") + "/v1beta"
+}
+
+// validateVertex guards project/location before hostname interpolation
+// (anti-SSRF), mirroring endpointURL.
+func validateVertex(o options) error {
+	if !validGCPIdentifier(o.project) {
+		return fmt.Errorf("google: invalid vertex project %q", o.project)
+	}
+	if !validGCPIdentifier(o.location) {
+		return fmt.Errorf("google: invalid vertex location %q", o.location)
+	}
+	return nil
+}
