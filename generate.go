@@ -598,11 +598,17 @@ func (ts *TextStream) buildResult() *TextResult {
 	return result
 }
 
-// buildParams converts options to provider.GenerateParams.
-func buildParams(opts options) provider.GenerateParams {
-	var tools []provider.ToolDefinition
-	for _, t := range opts.Tools {
-		tools = append(tools, provider.ToolDefinition{
+// ToolDefinitions converts high-level Tools to their wire-level
+// provider.ToolDefinition form (dropping the client-side Execute handler). It is
+// the single conversion used both by generation and by callers that need the
+// wire schema directly, e.g. building a Gemini cachedContents resource.
+func ToolDefinitions(tools []Tool) []provider.ToolDefinition {
+	if len(tools) == 0 {
+		return nil
+	}
+	defs := make([]provider.ToolDefinition, 0, len(tools))
+	for _, t := range tools {
+		defs = append(defs, provider.ToolDefinition{
 			Name:                   t.Name,
 			Description:            t.Description,
 			InputSchema:            t.InputSchema,
@@ -611,6 +617,12 @@ func buildParams(opts options) provider.GenerateParams {
 			DeferLoading:           t.DeferLoading,
 		})
 	}
+	return defs
+}
+
+// buildParams converts options to provider.GenerateParams.
+func buildParams(opts options) provider.GenerateParams {
+	tools := ToolDefinitions(opts.Tools)
 
 	msgs := opts.Messages
 	if opts.Prompt != "" {

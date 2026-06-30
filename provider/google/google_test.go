@@ -957,7 +957,7 @@ func TestWithHTTPClient(t *testing.T) {
 	customClient := &http.Client{}
 	model := Chat("gemini-2.5-flash", WithAPIKey("key"), WithHTTPClient(customClient))
 	cm := model.(*chatModel)
-	if cm.httpClient() != customClient {
+	if httpClientFor(cm.opts) != customClient {
 		t.Error("WithHTTPClient should set custom client")
 	}
 }

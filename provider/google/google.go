@@ -104,6 +104,16 @@ func WithHTTPClient(c *http.Client) Option {
 
 // Chat creates a Google Gemini language model for the given model ID.
 func Chat(modelID string, opts ...Option) provider.LanguageModel {
+	return &chatModel{
+		id:   modelID,
+		opts: resolveOptions(opts...),
+	}
+}
+
+// resolveOptions applies the functional options and fills auth/base URL from the
+// environment, mirroring the resolution used by every capability constructor
+// (Chat, Embedding, NewCacheClient).
+func resolveOptions(opts ...Option) options {
 	o := options{baseURL: defaultBaseURL}
 	for _, opt := range opts {
 		opt(&o)
@@ -122,10 +132,7 @@ func Chat(modelID string, opts ...Option) provider.LanguageModel {
 			o.baseURL = base
 		}
 	}
-	return &chatModel{
-		id:   modelID,
-		opts: o,
-	}
+	return o
 }
 
 type chatModel struct {
@@ -241,48 +248,60 @@ func googleOpts(params provider.GenerateParams) map[string]any {
 	return nil
 }
 
-func (m *chatModel) buildRequest(params provider.GenerateParams) (geminiRequestBody, error) {
-	body := geminiRequestBody{}
-	gopts := googleOpts(params)
+// buildSystemInstruction returns the systemInstruction wire object for the
+// given system prompt, or nil when empty (omitempty drops it). Shared by chat
+// requests and cachedContents creation so a cached prefix matches the request.
+func buildSystemInstruction(system string) any {
+	if system == "" {
+		return nil
+	}
+	return map[string]any{
+		"parts": []map[string]any{
+			{"text": system},
+		},
+	}
+}
 
-	// System instruction (first for cache prefix).
-	if params.System != "" {
-		body.SystemInstruction = map[string]any{
-			"parts": []map[string]any{
-				{"text": params.System},
-			},
-		}
+// buildToolsAndConfig serializes the tools array and toolConfig from a tool set,
+// tool choice and provider options. It is the single source of truth for Gemini
+// tool serialization, shared by chat requests (buildRequest) and cachedContents
+// creation (cache.go) so a cached prefix is byte-identical to what a request
+// would send. Returns nil payloads when there is nothing to send.
+//
+// Tools are split into function declarations and provider-defined tools; the
+// Gemini API sends them as separate entries in the tools array:
+//
+//	[{"functionDeclarations": [...]}, {"googleSearch": {...}}, {"urlContext": {}}, ...]
+func buildToolsAndConfig(toolDefs []provider.ToolDefinition, toolChoice string, providerOptions map[string]any) (toolsPayload any, toolConfigPayload any, err error) {
+	var gopts map[string]any
+	if g, ok := providerOptions["google"].(map[string]any); ok {
+		gopts = g
 	}
 
-	// Tools -- split into function declarations and provider-defined tools.
-	// Gemini API sends these as separate entries in the tools array:
-	//   [{"functionDeclarations": [...]}, {"googleSearch": {...}}, {"urlContext": {}}, ...]
 	var functionDecls []map[string]any
 	var providerTools []map[string]any
-
-	for _, t := range params.Tools {
+	for _, t := range toolDefs {
 		if t.ProviderDefinedType != "" {
 			// Provider-defined tool (google_search, url_context, code_execution).
-			// Map ProviderDefinedType to Gemini API key format.
 			providerTools = append(providerTools, googleProviderTool(t))
-		} else {
-			// Regular function tool.
-			decl := map[string]any{
-				"name":        t.Name,
-				"description": t.Description,
-			}
-			if len(t.InputSchema) > 0 {
-				var schema any
-				if err := json.Unmarshal(t.InputSchema, &schema); err != nil {
-					return geminiRequestBody{}, fmt.Errorf("google: invalid tool schema for %s: %w", t.Name, err)
-				}
-				if schemaMap, ok := schema.(map[string]any); ok {
-					schema = sanitizeGeminiSchema(schemaMap)
-				}
-				decl["parameters"] = schema
-			}
-			functionDecls = append(functionDecls, decl)
+			continue
 		}
+		// Regular function tool.
+		decl := map[string]any{
+			"name":        t.Name,
+			"description": t.Description,
+		}
+		if len(t.InputSchema) > 0 {
+			var schema any
+			if uerr := json.Unmarshal(t.InputSchema, &schema); uerr != nil {
+				return nil, nil, fmt.Errorf("google: invalid tool schema for %s: %w", t.Name, uerr)
+			}
+			if schemaMap, ok := schema.(map[string]any); ok {
+				schema = sanitizeGeminiSchema(schemaMap)
+			}
+			decl["parameters"] = schema
+		}
+		functionDecls = append(functionDecls, decl)
 	}
 
 	var tools []map[string]any
@@ -290,23 +309,21 @@ func (m *chatModel) buildRequest(params provider.GenerateParams) (geminiRequestB
 		tools = append(tools, map[string]any{"functionDeclarations": functionDecls})
 	}
 	tools = append(tools, providerTools...)
-
 	// Legacy ProviderOptions google_search -- kept for backward compat.
 	if gopts != nil {
 		if gs, ok := gopts["google_search"].(map[string]any); ok {
 			tools = append(tools, map[string]any{"googleSearch": gs})
 		}
 	}
-
 	if len(tools) > 0 {
-		body.Tools = tools
+		toolsPayload = tools
 	}
 
 	// Tool choice → toolConfig.functionCallingConfig.
 	toolConfig := map[string]any{}
-	if params.ToolChoice != "" {
+	if toolChoice != "" {
 		fcc := map[string]any{}
-		switch params.ToolChoice {
+		switch toolChoice {
 		case "auto":
 			fcc["mode"] = "AUTO"
 		case "none":
@@ -315,30 +332,46 @@ func (m *chatModel) buildRequest(params provider.GenerateParams) (geminiRequestB
 			fcc["mode"] = "ANY"
 		default:
 			fcc["mode"] = "ANY"
-			fcc["allowedFunctionNames"] = []string{params.ToolChoice}
+			fcc["allowedFunctionNames"] = []string{toolChoice}
 		}
 		toolConfig["functionCallingConfig"] = fcc
 	}
-
 	// Legacy retrievalConfig from ProviderOptions.
 	if gopts != nil {
 		if rc, ok := gopts["retrievalConfig"].(map[string]any); ok {
 			toolConfig["retrievalConfig"] = rc
 		}
 	}
-
 	// toolConfig from ProviderOptions (flat key, not under google namespace).
 	// Used for Gemini 3.x include_server_side_tool_invocations and other
 	// root-level toolConfig fields.
-	if tc, ok := params.ProviderOptions["toolConfig"].(map[string]any); ok {
+	if tc, ok := providerOptions["toolConfig"].(map[string]any); ok {
 		for k, v := range tc {
 			toolConfig[k] = v
 		}
 	}
-
 	if len(toolConfig) > 0 {
-		body.ToolConfig = toolConfig
+		toolConfigPayload = toolConfig
 	}
+
+	return toolsPayload, toolConfigPayload, nil
+}
+
+func (m *chatModel) buildRequest(params provider.GenerateParams) (geminiRequestBody, error) {
+	body := geminiRequestBody{}
+	gopts := googleOpts(params)
+
+	// System instruction (first for cache prefix).
+	body.SystemInstruction = buildSystemInstruction(params.System)
+
+	// Tools and toolConfig — serialized by the shared helper so an explicit
+	// cachedContents resource holds a byte-identical prefix (see cache.go).
+	tools, toolConfig, err := buildToolsAndConfig(params.Tools, params.ToolChoice, params.ProviderOptions)
+	if err != nil {
+		return geminiRequestBody{}, err
+	}
+	body.Tools = tools
+	body.ToolConfig = toolConfig
 
 	// Safety settings from ProviderOptions.
 	if gopts != nil {
@@ -909,33 +942,41 @@ func parseResponse(body []byte) (*provider.GenerateResult, error) {
 // --- HTTP helpers ---
 
 func (m *chatModel) doHTTP(ctx context.Context, url string, body any, perRequestHeaders map[string]string) (*http.Response, error) {
-	token, err := m.resolveToken(ctx)
+	return doGoogleJSON(ctx, m.opts, http.MethodPost, url, body, perRequestHeaders)
+}
+
+// doGoogleJSON sends a JSON request to the Gemini REST API with the right auth
+// (Bearer for Vertex, x-goog-api-key otherwise) and maps any non-2xx status to
+// a goai error. Shared by chat generation and cachedContents management so they
+// authenticate and route identically.
+func doGoogleJSON(ctx context.Context, o options, method, url string, body any, perRequestHeaders map[string]string) (*http.Response, error) {
+	token, err := resolveAuthToken(ctx, o)
 	if err != nil {
 		return nil, fmt.Errorf("resolving auth token: %w", err)
 	}
 
 	jsonBody := httpc.MustMarshalJSON(body)
-	req := httpc.MustNewRequest(ctx, "POST", url, jsonBody)
+	req := httpc.MustNewRequest(ctx, method, url, jsonBody)
 	req.Header.Set("Content-Type", "application/json")
-	if m.opts.isVertex {
+	if o.isVertex {
 		req.Header.Set("Authorization", "Bearer "+token)
 	} else {
 		req.Header.Set("x-goog-api-key", token)
 	}
 
-	for k, v := range m.opts.headers {
+	for k, v := range o.headers {
 		req.Header.Set(k, v)
 	}
 	for k, v := range perRequestHeaders {
 		req.Header.Set(k, v)
 	}
 
-	resp, err := m.httpClient().Do(req)
+	resp, err := httpClientFor(o).Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("sending request: %w", err)
 	}
 
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		respBody, _ := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
 		return nil, goai.ParseHTTPErrorWithHeaders("google", resp.StatusCode, respBody, resp.Header)
@@ -944,11 +985,20 @@ func (m *chatModel) doHTTP(ctx context.Context, url string, body any, perRequest
 	return resp, nil
 }
 
-func (m *chatModel) httpClient() *http.Client {
-	if m.opts.httpClient != nil {
-		return m.opts.httpClient
+func httpClientFor(o options) *http.Client {
+	if o.httpClient != nil {
+		return o.httpClient
 	}
 	return http.DefaultClient
+}
+
+// vertexHost returns the aiplatform host for a region. The "global" region has
+// no location prefix on the hostname.
+func vertexHost(location string) string {
+	if location == "global" {
+		return "aiplatform.googleapis.com"
+	}
+	return location + "-aiplatform.googleapis.com"
 }
 
 // endpointURL builds the request URL for an action (generateContent /
@@ -968,13 +1018,8 @@ func (m *chatModel) endpointURL(action, query string) (string, error) {
 	if base := strings.TrimRight(m.opts.baseURL, "/"); base != defaultBaseURL && base != "" {
 		return fmt.Sprintf("%s/%s:%s%s", base, url.PathEscape(m.id), action, query), nil
 	}
-	// The "global" region has no location prefix on the hostname.
-	host := m.opts.location + "-aiplatform.googleapis.com"
-	if m.opts.location == "global" {
-		host = "aiplatform.googleapis.com"
-	}
 	return fmt.Sprintf("https://%s/v1beta1/projects/%s/locations/%s/publishers/google/models/%s:%s%s",
-		host, m.opts.project, m.opts.location, url.PathEscape(m.id), action, query), nil
+		vertexHost(m.opts.location), m.opts.project, m.opts.location, url.PathEscape(m.id), action, query), nil
 }
 
 // validGCPIdentifier guards project/location before hostname interpolation
@@ -986,11 +1031,11 @@ func validGCPIdentifier(s string) bool {
 	return validGCPIdentifierRE.MatchString(s) && !strings.Contains(s, "..")
 }
 
-func (m *chatModel) resolveToken(ctx context.Context) (string, error) {
-	if m.opts.tokenSource == nil {
+func resolveAuthToken(ctx context.Context, o options) (string, error) {
+	if o.tokenSource == nil {
 		return "", errors.New("goai: no API key or token source configured")
 	}
-	return m.opts.tokenSource.Token(ctx)
+	return o.tokenSource.Token(ctx)
 }
 
 // --- Schema sanitization ---
