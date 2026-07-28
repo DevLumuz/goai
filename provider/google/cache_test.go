@@ -87,7 +87,9 @@ func TestCacheClient_Create_DirectShape(t *testing.T) {
 // The parity test: a cached resource must hold the SAME server tools and
 // toolConfig that a generate request would send — otherwise a cached turn loses
 // web_search/url_context and the mixed-tools config.
-func TestCacheClient_Create_IncludesClientAndServerTools(t *testing.T) {
+// The parity test: a cached prefix must carry the same tools and toolConfig a
+// generate request would send, or a cached turn silently loses them.
+func TestCacheClient_Create_IncludesServerToolsAndToolConfig(t *testing.T) {
 	var body map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewDecoder(r.Body).Decode(&body)
@@ -105,6 +107,12 @@ func TestCacheClient_Create_IncludesClientAndServerTools(t *testing.T) {
 			{ProviderDefinedType: "google.google_search"},
 			{ProviderDefinedType: "google.url_context"},
 		},
+		ProviderOptions: map[string]any{
+			"toolConfig": map[string]any{
+				"includeServerSideToolInvocations": true,
+				"functionCallingConfig":            map[string]any{"mode": "VALIDATED"},
+			},
+		},
 		TTL: time.Hour,
 	})
 	if err != nil {
@@ -119,6 +127,13 @@ func TestCacheClient_Create_IncludesClientAndServerTools(t *testing.T) {
 	}
 	if findToolEntry(t, body, "urlContext") == nil {
 		t.Error("server tool urlContext missing from cache body")
+	}
+	tc, ok := body["toolConfig"].(map[string]any)
+	if !ok {
+		t.Fatalf("toolConfig missing/!object: %v", body["toolConfig"])
+	}
+	if tc["includeServerSideToolInvocations"] != true {
+		t.Errorf("includeServerSideToolInvocations = %v", tc["includeServerSideToolInvocations"])
 	}
 }
 

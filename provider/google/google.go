@@ -348,6 +348,13 @@ func buildToolsAndConfig(toolDefs []provider.ToolDefinition, toolChoice string, 
 			toolConfig["retrievalConfig"] = rc
 		}
 	}
+	// toolConfig as a flat key, merged last: Gemini 3.x needs
+	// include_server_side_tool_invocations there, alongside the fields above.
+	if tc, ok := providerOptions["toolConfig"].(map[string]any); ok {
+		for k, v := range tc {
+			toolConfig[k] = v
+		}
+	}
 
 	if len(toolConfig) > 0 {
 		toolConfigPayload = toolConfig
