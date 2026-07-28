@@ -1,10 +1,15 @@
 {
-  "latest": "v0.9.1",
+  "latest": "v0.9.2",
   "versions": [
+    {
+      "tag": "v0.9.2",
+      "date": "2026-07-28",
+      "label": "v0.9.2 (latest)"
+    },
     {
       "tag": "v0.9.1",
       "date": "2026-07-27",
-      "label": "v0.9.1 (latest)"
+      "label": "v0.9.1"
     },
     {
       "tag": "v0.10.0",
