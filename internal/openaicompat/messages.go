@@ -1,7 +1,6 @@
 package openaicompat
 
 import (
-	"fmt"
 	"strings"
 
 	"github.com/zendev-sh/goai/provider"
@@ -100,10 +99,17 @@ func ConvertMessages(msgs []provider.Message, system string) []map[string]any {
 						"image_url": imgURL,
 					})
 				case provider.PartFile:
-					contentArr = append(contentArr, filePartToContent(part))
+					if item, ok := filePartToContent(part); ok {
+						contentArr = append(contentArr, item)
+					}
 				}
 			}
-			m["content"] = contentArr
+			if len(contentArr) == 0 {
+				// Every part was dropped: keep the message valid.
+				m["content"] = ""
+			} else {
+				m["content"] = contentArr
+			}
 			result = append(result, m)
 			continue
 		}
@@ -140,25 +146,82 @@ func joinText(parts []string) string {
 	return strings.Join(parts, "\n")
 }
 
-// filePartToContent converts a PartFile to an OpenAI content item.
-// For compat providers without native file APIs, the file bytes are inlined as base64 text.
-func filePartToContent(part provider.Part) map[string]any {
-	var data string
-	if part.RemoteRef != nil && len(part.RemoteRef.Data) > 0 {
-		data = part.RemoteRef.MediaType + ";base64," + string(part.RemoteRef.Data)
-	} else if part.URL != "" {
-		// Strip the "data:" prefix if present.
-		if strings.HasPrefix(part.URL, "data:") {
-			data = part.URL[5:]
-		} else {
-			data = part.URL
+// filePartToContent converts a PartFile to an OpenAI content item using the
+// chat completions shapes that OpenAI and compat gateways (OpenRouter et al.)
+// accept: PDFs become a "file" part (inline data URL, or the plain URL for
+// remote files) and audio becomes an "input_audio" part. Anything else has no
+// wire representation and is omitted (ok=false) — inlining raw base64 as text
+// only feeds the model garbage.
+func filePartToContent(part provider.Part) (map[string]any, bool) {
+	mediaType := part.MediaType
+	fileData := "" // what goes in file.file_data: a data URL or a plain URL
+	payload := ""  // bare base64 for input_audio
+
+	switch {
+	case part.RemoteRef != nil && len(part.RemoteRef.Data) > 0:
+		if mediaType == "" {
+			mediaType = part.RemoteRef.MediaType
 		}
+		payload = string(part.RemoteRef.Data)
+		fileData = "data:" + mediaType + ";base64," + payload
+	case strings.HasPrefix(part.URL, "data:"):
+		rest := part.URL[5:]
+		if i := strings.Index(rest, ";base64,"); i >= 0 {
+			if mediaType == "" {
+				mediaType = rest[:i]
+			}
+			payload = rest[i+len(";base64,"):]
+		}
+		fileData = "data:" + mediaType + ";base64," + payload
+	case part.URL != "":
+		// Remote URL: usable for the "file" part (gateways fetch it), never
+		// for input_audio (audio must be base64 inline).
+		fileData = part.URL
 	}
-	if data == "" {
-		return map[string]any{"type": "text", "text": ""}
+
+	if mediaType == "application/pdf" && fileData != "" {
+		filename := part.Filename
+		if filename == "" {
+			filename = "document.pdf"
+		}
+		return map[string]any{
+			"type": "file",
+			"file": map[string]any{
+				"filename":  filename,
+				"file_data": fileData,
+			},
+		}, true
 	}
-	return map[string]any{
-		"type": "text",
-		"text": fmt.Sprintf("data:%s", data),
+	if format, ok := audioFormat(mediaType); ok && payload != "" {
+		return map[string]any{
+			"type": "input_audio",
+			"input_audio": map[string]any{
+				"data":   payload,
+				"format": format,
+			},
+		}, true
 	}
+	return nil, false
+}
+
+// audioFormat maps an audio media type to the input_audio format
+// identifier (wav, mp3, aiff, aac, ogg, flac, m4a).
+func audioFormat(mediaType string) (string, bool) {
+	switch mediaType {
+	case "audio/wav", "audio/wave", "audio/x-wav":
+		return "wav", true
+	case "audio/mp3", "audio/mpeg":
+		return "mp3", true
+	case "audio/aiff", "audio/x-aiff":
+		return "aiff", true
+	case "audio/aac":
+		return "aac", true
+	case "audio/ogg", "application/ogg":
+		return "ogg", true
+	case "audio/flac", "audio/x-flac":
+		return "flac", true
+	case "audio/mp4", "audio/x-m4a":
+		return "m4a", true
+	}
+	return "", false
 }

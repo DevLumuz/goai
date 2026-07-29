@@ -304,8 +304,18 @@ func TestConvertMessages_UserWithFile_InlineURL(t *testing.T) {
 	if content[0]["type"] != "text" {
 		t.Errorf("first part type = %v", content[0]["type"])
 	}
-	if content[1]["type"] != "text" {
-		t.Errorf("second part type = text, got %v", content[1]["type"])
+	if content[1]["type"] != "file" {
+		t.Fatalf("second part type = file, got %v", content[1]["type"])
+	}
+	file, ok := content[1]["file"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected file object, got %T", content[1]["file"])
+	}
+	if file["filename"] != "doc.pdf" {
+		t.Errorf("filename = %v", file["filename"])
+	}
+	if file["file_data"] != "data:application/pdf;base64,JVBERi0=" {
+		t.Errorf("file_data = %v", file["file_data"])
 	}
 }
 
@@ -339,15 +349,61 @@ func TestConvertMessages_UserWithFile_RemoteRef(t *testing.T) {
 	if content[0]["type"] != "text" {
 		t.Errorf("first part type = %v", content[0]["type"])
 	}
-	if content[1]["type"] != "text" {
-		t.Errorf("second part type = text, got %v", content[1]["type"])
+	if content[1]["type"] != "file" {
+		t.Fatalf("second part type = file, got %v", content[1]["type"])
 	}
-	text, ok := content[1]["text"].(string)
+	file, ok := content[1]["file"].(map[string]any)
 	if !ok {
-		t.Fatal("expected text string")
+		t.Fatalf("expected file object, got %T", content[1]["file"])
 	}
-	if text != "data:application/pdf;base64,JVBERi0=" {
-		t.Errorf("text = %q", text)
+	if file["file_data"] != "data:application/pdf;base64,JVBERi0=" {
+		t.Errorf("file_data = %v", file["file_data"])
+	}
+}
+
+func TestConvertMessages_UserWithFile_AudioFormats(t *testing.T) {
+	cases := []struct {
+		mediaType string
+		format    string
+	}{
+		{"audio/wav", "wav"},
+		{"audio/wave", "wav"},
+		{"audio/mp3", "mp3"},
+		{"audio/mpeg", "mp3"},
+		{"audio/aiff", "aiff"},
+		{"audio/aac", "aac"},
+		{"audio/ogg", "ogg"},
+		{"application/ogg", "ogg"},
+		{"audio/flac", "flac"},
+		{"audio/mp4", "m4a"},
+	}
+	for _, tc := range cases {
+		msgs := []provider.Message{
+			{
+				Role: provider.RoleUser,
+				Content: []provider.Part{
+					{Type: provider.PartFile, URL: "data:" + tc.mediaType + ";base64,QUJD", MediaType: tc.mediaType},
+				},
+			},
+		}
+		result := ConvertMessages(msgs, "")
+		content, ok := result[0]["content"].([]map[string]any)
+		if !ok || len(content) != 1 {
+			t.Fatalf("%s: unexpected content %v", tc.mediaType, result[0]["content"])
+		}
+		if content[0]["type"] != "input_audio" {
+			t.Fatalf("%s: part type = %v, want input_audio", tc.mediaType, content[0]["type"])
+		}
+		audio, ok := content[0]["input_audio"].(map[string]any)
+		if !ok {
+			t.Fatalf("%s: expected input_audio object, got %T", tc.mediaType, content[0]["input_audio"])
+		}
+		if audio["format"] != tc.format {
+			t.Errorf("%s: format = %v, want %s", tc.mediaType, audio["format"], tc.format)
+		}
+		if audio["data"] != "QUJD" {
+			t.Errorf("%s: data = %v, want bare base64 without data: prefix", tc.mediaType, audio["data"])
+		}
 	}
 }
 
@@ -364,15 +420,9 @@ func TestConvertMessages_UserWithFile_RemoteRefNoData(t *testing.T) {
 	if len(result) != 1 {
 		t.Fatalf("got %d messages, want 1", len(result))
 	}
-	content, ok := result[0]["content"].([]map[string]any)
-	if !ok {
-		t.Fatalf("expected content array, got %T", result[0]["content"])
-	}
-	if len(content) != 1 {
-		t.Fatalf("got %d content parts, want 1", len(content))
-	}
-	if content[0]["type"] != "text" {
-		t.Errorf("part type = %v", content[0]["type"])
+	// No data and no media type: the part is dropped, message stays valid.
+	if content, ok := result[0]["content"].(string); !ok || content != "" {
+		t.Fatalf("content = %v, want empty string", result[0]["content"])
 	}
 }
 
@@ -389,22 +439,36 @@ func TestConvertMessages_UserWithFile_NonDataURL(t *testing.T) {
 	if len(result) != 1 {
 		t.Fatalf("got %d messages, want 1", len(result))
 	}
+	// A bare URL without a media type has no wire shape: dropped.
+	if content, ok := result[0]["content"].(string); !ok || content != "" {
+		t.Fatalf("content = %v, want empty string", result[0]["content"])
+	}
+}
+
+func TestConvertMessages_UserWithFile_PDFByURL(t *testing.T) {
+	msgs := []provider.Message{
+		{
+			Role: provider.RoleUser,
+			Content: []provider.Part{
+				{Type: provider.PartFile, URL: "https://example.com/doc.pdf", MediaType: "application/pdf", Filename: "doc.pdf"},
+			},
+		},
+	}
+	result := ConvertMessages(msgs, "")
 	content, ok := result[0]["content"].([]map[string]any)
+	if !ok || len(content) != 1 {
+		t.Fatalf("unexpected content: %v", result[0]["content"])
+	}
+	if content[0]["type"] != "file" {
+		t.Fatalf("part type = file, got %v", content[0]["type"])
+	}
+	file, ok := content[0]["file"].(map[string]any)
 	if !ok {
-		t.Fatalf("expected content array, got %T", result[0]["content"])
+		t.Fatalf("expected file object, got %T", content[0]["file"])
 	}
-	if len(content) != 1 {
-		t.Fatalf("got %d content parts, want 1", len(content))
-	}
-	if content[0]["type"] != "text" {
-		t.Errorf("part type = %v", content[0]["type"])
-	}
-	text, ok := content[0]["text"].(string)
-	if !ok {
-		t.Fatal("expected text string")
-	}
-	if text != "data:https://example.com/doc.pdf" {
-		t.Errorf("text = %q", text)
+	// Remote PDFs pass the plain URL through file_data (gateways fetch it).
+	if file["file_data"] != "https://example.com/doc.pdf" {
+		t.Errorf("file_data = %v", file["file_data"])
 	}
 }
 
@@ -421,15 +485,9 @@ func TestConvertMessages_UserWithFile_EmptyURL(t *testing.T) {
 	if len(result) != 1 {
 		t.Fatalf("got %d messages, want 1", len(result))
 	}
-	content, ok := result[0]["content"].([]map[string]any)
-	if !ok {
-		t.Fatalf("expected content array, got %T", result[0]["content"])
-	}
-	if len(content) != 1 {
-		t.Fatalf("got %d content parts, want 1", len(content))
-	}
-	if content[0]["type"] != "text" {
-		t.Errorf("part type = %v", content[0]["type"])
+	// An empty PartFile carries nothing: dropped, message stays valid.
+	if content, ok := result[0]["content"].(string); !ok || content != "" {
+		t.Fatalf("content = %v, want empty string", result[0]["content"])
 	}
 }
 
@@ -462,8 +520,19 @@ func TestConvertMessages_UserWithFileAndImage(t *testing.T) {
 	if content[1]["type"] != "image_url" {
 		t.Errorf("part[1] type = %v", content[1]["type"])
 	}
-	if content[2]["type"] != "text" {
-		t.Errorf("part[2] type = text, got %v", content[2]["type"])
+	if content[2]["type"] != "file" {
+		t.Fatalf("part[2] type = file, got %v", content[2]["type"])
+	}
+	file, ok := content[2]["file"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected file object, got %T", content[2]["file"])
+	}
+	// The media type comes from the data URI; a missing filename falls back.
+	if file["filename"] != "document.pdf" {
+		t.Errorf("filename = %v", file["filename"])
+	}
+	if file["file_data"] != "data:application/pdf;base64,pdf456" {
+		t.Errorf("file_data = %v", file["file_data"])
 	}
 }
 
@@ -487,8 +556,8 @@ func TestConvertMessages_UserWithFileOnly(t *testing.T) {
 	if len(content) != 1 {
 		t.Fatalf("got %d content parts, want 1", len(content))
 	}
-	if content[0]["type"] != "text" {
-		t.Errorf("part type = text, got %v", content[0]["type"])
+	if content[0]["type"] != "file" {
+		t.Errorf("part type = file, got %v", content[0]["type"])
 	}
 }
 
