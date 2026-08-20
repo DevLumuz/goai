@@ -4910,3 +4910,51 @@ func TestParseResponsesResult_SingleSummaryHasNoSeparator(t *testing.T) {
 		t.Errorf("Reasoning = %q, want %q", result.Reasoning, "Only one.")
 	}
 }
+
+func TestConvertToResponsesInput_OutputTextIncludesAnnotations(t *testing.T) {
+	msgs := []provider.Message{
+		{
+			Role:    provider.RoleUser,
+			Content: []provider.Part{{Type: provider.PartText, Text: "Hello"}},
+		},
+		{
+			Role:    provider.RoleAssistant,
+			Content: []provider.Part{{Type: provider.PartText, Text: "Hi there!"}},
+		},
+		{
+			Role:    provider.RoleUser,
+			Content: []provider.Part{{Type: provider.PartText, Text: "How are you?"}},
+		},
+	}
+
+	input := convertToResponsesInput(msgs)
+	if len(input) != 3 {
+		t.Fatalf("input length = %d, want 3", len(input))
+	}
+
+	assistantMsg := input[1]
+	if assistantMsg["role"] != "assistant" || assistantMsg["type"] != "message" {
+		t.Fatalf("assistantMsg = %+v", assistantMsg)
+	}
+
+	content, ok := assistantMsg["content"].([]map[string]any)
+	if !ok || len(content) == 0 {
+		t.Fatalf("assistant content = %+v", assistantMsg["content"])
+	}
+
+	outputText := content[0]
+	if outputText["type"] != "output_text" {
+		t.Errorf("type = %v, want output_text", outputText["type"])
+	}
+	if outputText["text"] != "Hi there!" {
+		t.Errorf("text = %v, want Hi there!", outputText["text"])
+	}
+	annotations, ok := outputText["annotations"].([]any)
+	if !ok {
+		t.Fatalf("annotations = %v, want []any{}", outputText["annotations"])
+	}
+	if len(annotations) != 0 {
+		t.Errorf("annotations len = %d, want 0", len(annotations))
+	}
+}
+
