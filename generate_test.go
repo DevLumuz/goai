@@ -6707,3 +6707,42 @@ func TestBuildParams_CacheTTLDefaultsEmpty(t *testing.T) {
 		t.Errorf("CacheTTL = %q, want empty (provider default)", params.CacheTTL)
 	}
 }
+
+func TestReasoningAccumulator_RetainsFinishedParts(t *testing.T) {
+	var acc reasoningAccumulator
+	chunk := provider.StreamChunk{Type: provider.ChunkReasoning, Text: "thinking ", Metadata: map[string]any{"blockId": "first"}}
+	for range 1024 {
+		acc.add(chunk)
+	}
+	acc.add(provider.StreamChunk{Type: provider.ChunkReasoning, Metadata: map[string]any{"blockId": "first", "signature": "signed"}})
+	first := acc.finish()
+	acc.add(provider.StreamChunk{Type: provider.ChunkReasoning, Text: "next", Metadata: map[string]any{"blockId": "second"}})
+	second := acc.finish()
+	if len(first) != 1 || first[0].Text != strings.Repeat(chunk.Text, 1024) || first[0].ProviderOptions["signature"] != "signed" {
+		t.Fatal("finished reasoning text or signature changed after accumulator reuse")
+	}
+	if len(second) != 1 || second[0].Text != "next" || len(acc.finish()) != 0 {
+		t.Fatalf("accumulator retained a previous block: %#v", second)
+	}
+}
+
+func BenchmarkReasoningAccumulator(b *testing.B) {
+	chunk := provider.StreamChunk{Type: provider.ChunkReasoning, Text: strings.Repeat("x", 64)}
+	for _, count := range []int{128, 1024} {
+		b.Run(fmt.Sprint(count), func(b *testing.B) {
+			want := strings.Repeat(chunk.Text, count)
+			b.ReportAllocs()
+			b.SetBytes(int64(len(want)))
+			for b.Loop() {
+				var acc reasoningAccumulator
+				for range count {
+					acc.add(chunk)
+				}
+				parts := acc.finish()
+				if len(parts) != 1 || parts[0].Text != want {
+					b.Fatal("reasoning text changed")
+				}
+			}
+		})
+	}
+}

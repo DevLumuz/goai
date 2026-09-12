@@ -585,7 +585,7 @@ func TestRepairJSON_ExceedsMaxDepth(t *testing.T) {
 	for range depth {
 		b.WriteString(`{"a":`)
 	}
-	b.WriteString(`1`) // innermost value
+	b.WriteString(`1`)  // innermost value
 	input := b.String() // intentionally truncated - no closing braces
 
 	got := repairJSON(input)
@@ -627,5 +627,16 @@ func TestRepairJSON_ExceedsMaxDepth_Arrays(t *testing.T) {
 	var v any
 	if err := json.Unmarshal([]byte(got), &v); err != nil {
 		t.Errorf("repairJSON with %d nested '[' produced invalid JSON: %v\nresult (first 200 bytes): %.200s", depth, err, got)
+	}
+}
+
+func BenchmarkRepairJSONNested(b *testing.B) {
+	input := strings.Repeat("[", 128) + `"` + strings.Repeat("x", 4096) + `"`
+	want := input + strings.Repeat("]", 128)
+	b.ReportAllocs()
+	for b.Loop() {
+		if repairJSON(input) != want {
+			b.Fatal("nested JSON repair changed")
+		}
 	}
 }

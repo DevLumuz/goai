@@ -149,6 +149,7 @@ type StepResult struct {
 }
 
 type reasoningAccumulator struct {
+	text    strings.Builder
 	parts   []provider.Part
 	current *provider.Part
 	key     string
@@ -163,7 +164,9 @@ func (a *reasoningAccumulator) add(chunk provider.StreamChunk) {
 		a.current = &provider.Part{Type: provider.PartReasoning, ProviderOptions: map[string]any{}}
 		a.key = key
 	}
-	a.current.Text += chunk.Text
+	// Keep boundary checks current without copying the growing reasoning prefix.
+	a.text.WriteString(chunk.Text)
+	a.current.Text = a.text.String()
 	for k, v := range chunk.Metadata {
 		if k != "source" {
 			a.current.ProviderOptions[k] = v
@@ -201,6 +204,7 @@ func (a *reasoningAccumulator) flush() {
 		a.parts = append(a.parts, *a.current)
 	}
 	a.current = nil
+	a.text.Reset()
 	a.key = ""
 }
 

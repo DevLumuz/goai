@@ -413,6 +413,7 @@ func parseConverseResponse(body []byte) (*provider.GenerateResult, error) {
 	}
 
 	// Parse content blocks.
+	var textParts []string
 	var reasoningParts []map[string]any
 	var reasoningTextBuf strings.Builder
 	for _, raw := range resp.Output.Message.Content {
@@ -421,7 +422,7 @@ func parseConverseResponse(body []byte) (*provider.GenerateResult, error) {
 			continue
 		}
 		if text, ok := block["text"].(string); ok {
-			result.Text += text
+			textParts = append(textParts, text)
 		}
 		if tu, ok := block["toolUse"].(map[string]any); ok {
 			tc := provider.ToolCall{
@@ -457,6 +458,8 @@ func parseConverseResponse(body []byte) (*provider.GenerateResult, error) {
 			}
 		}
 	}
+
+	result.Text = strings.Join(textParts, "")
 
 	// Surface concatenated reasoning text on the top-level result so
 	// callers (goai TextResult.Reasoning) can render thinking in the

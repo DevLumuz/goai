@@ -623,17 +623,17 @@ func convertMessage(msg provider.Message) ([]ollamaMessage, error) {
 		}}, nil
 
 	case provider.RoleAssistant:
-		var text, thinking string
+		var text, thinking []string
 		var toolCalls []ollamaToolCall
 
 		for _, part := range msg.Content {
 			switch part.Type {
 			case provider.PartText:
-				text += part.Text
+				text = append(text, part.Text)
 			case provider.PartReasoning:
 				// Carry reasoning in the native thinking field rather than
 				// merging it into content, so it round-trips correctly.
-				thinking += part.Text
+				thinking = append(thinking, part.Text)
 			case provider.PartToolCall:
 				raw := part.ToolInput
 				if raw == nil {
@@ -650,8 +650,8 @@ func convertMessage(msg provider.Message) ([]ollamaMessage, error) {
 
 		return []ollamaMessage{{
 			Role:      "assistant",
-			Content:   text,
-			Thinking:  thinking,
+			Content:   strings.Join(text, ""),
+			Thinking:  strings.Join(thinking, ""),
 			ToolCalls: toolCalls,
 		}}, nil
 

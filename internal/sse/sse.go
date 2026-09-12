@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"strings"
 )
 
 // MaxLineSize is the upper bound on a single SSE line, in bytes.
@@ -36,7 +35,7 @@ type Event struct {
 type Scanner struct {
 	reader   io.Reader
 	readBuf  [4096]byte
-	pending  []byte
+	pending  bytes.Buffer
 	scanFrom int
 	readErr  error
 	atStart  bool
@@ -77,7 +76,7 @@ func (s *Scanner) NextLine() (line string, ok bool) {
 			return "", false
 		}
 	}
-	return strings.TrimRight(raw, "\r\n"), true
+	return string(bytes.TrimRight(raw, "\r\n")), true
 }
 
 // NextEvent returns the next complete SSE event. Comments and events without
@@ -97,18 +96,18 @@ func (s *Scanner) NextEvent() (Event, bool) {
 	for {
 		raw, err := s.readLine()
 		if len(raw) > 0 {
-			line := strings.TrimRight(raw, "\r\n")
-			if line == "" {
+			line := bytes.TrimRight(raw, "\r\n")
+			if len(line) == 0 {
 				if hasData {
 					return event, true
 				}
 				event.Type = ""
 			} else if line[0] != ':' {
-				field, value, _ := strings.Cut(line, ":")
-				value = strings.TrimPrefix(value, " ")
-				switch field {
+				field, value, _ := bytes.Cut(line, []byte(":"))
+				value = bytes.TrimPrefix(value, []byte(" "))
+				switch string(field) {
 				case "event":
-					event.Type = value
+					event.Type = string(value)
 				case "data":
 					additional := len(value)
 					if hasData {
@@ -147,14 +146,14 @@ func (s *Scanner) Next() (data string, ok bool) {
 	for {
 		line, err := s.readLine()
 		if len(line) > 0 {
-			line = strings.TrimRight(line, "\r\n")
-			if strings.HasPrefix(line, "data:") {
-				payload := strings.TrimPrefix(strings.TrimPrefix(line, "data:"), " ")
-				if payload == "[DONE]" {
+			line = bytes.TrimRight(line, "\r\n")
+			if after, ok0 := bytes.CutPrefix(line, []byte("data:")); ok0 {
+				payload := bytes.TrimPrefix(after, []byte(" "))
+				if bytes.Equal(payload, []byte("[DONE]")) {
 					s.done = true
 					return "", false
 				}
-				return payload, true
+				return string(payload), true
 			}
 			// Non-"data:" line: skip and continue reading.
 		}
@@ -175,15 +174,17 @@ func (s *Scanner) Next() (data string, ok bool) {
 // Returns the line (including its terminator, when present) together with any
 // terminal error. A final partial line at EOF is returned with io.EOF. One
 // leading UTF-8 BOM is stripped from the stream before field parsing.
-func (s *Scanner) readLine() (string, error) {
+// The returned bytes are valid only until the next readLine call. Public
+// scanner methods copy any data they return to callers.
+func (s *Scanner) readLine() ([]byte, error) {
 	const maxConsecutiveEmptyReads = 100
 	emptyReads := 0
 
 	for {
 		if s.skipLF {
-			if len(s.pending) > 0 {
-				if s.pending[0] == '\n' {
-					s.pending = s.pending[1:]
+			if s.pending.Len() > 0 {
+				if s.pending.Bytes()[0] == '\n' {
+					s.pending.Next(1)
 				}
 				s.skipLF = false
 			} else if s.readErr != nil {
@@ -193,33 +194,33 @@ func (s *Scanner) readLine() (string, error) {
 
 		if end, complete := s.lineEnd(); complete {
 			if end > MaxLineSize {
-				return "", fmt.Errorf("sse: line exceeds %d bytes", MaxLineSize)
+				return nil, fmt.Errorf("sse: line exceeds %d bytes", MaxLineSize)
 			}
-			line := s.pending[:end]
-			s.pending = s.pending[end:]
+			line := s.pending.Next(end)
 			s.scanFrom = 0
-			if len(s.pending) == 0 {
-				s.pending = nil
+			// Reuse ordinary read buffers, but release oversized drained lines.
+			if s.pending.Len() == 0 && s.pending.Cap() > len(s.readBuf) {
+				s.pending = bytes.Buffer{}
 			}
-			return string(s.stripInitialBOM(line)), nil
+			return s.stripInitialBOM(line), nil
 		}
 
-		if len(s.pending) > MaxLineSize {
-			return "", fmt.Errorf("sse: line exceeds %d bytes", MaxLineSize)
+		if s.pending.Len() > MaxLineSize {
+			return nil, fmt.Errorf("sse: line exceeds %d bytes", MaxLineSize)
 		}
 		if s.readErr != nil {
-			if len(s.pending) == 0 {
-				return "", s.readErr
+			if s.pending.Len() == 0 {
+				return nil, s.readErr
 			}
-			line := s.pending
-			s.pending = nil
+			line := s.pending.Bytes()
+			s.pending = bytes.Buffer{}
 			s.scanFrom = 0
-			return string(s.stripInitialBOM(line)), s.readErr
+			return s.stripInitialBOM(line), s.readErr
 		}
 
 		n, err := s.reader.Read(s.readBuf[:])
 		if n > 0 {
-			s.pending = append(s.pending, s.readBuf[:n]...)
+			_, _ = s.pending.Write(s.readBuf[:n])
 			emptyReads = 0
 		} else if err == nil {
 			emptyReads++
@@ -234,15 +235,15 @@ func (s *Scanner) readLine() (string, error) {
 }
 
 func (s *Scanner) lineEnd() (int, bool) {
-	index := bytes.IndexAny(s.pending[s.scanFrom:], "\r\n")
+	index := bytes.IndexAny(s.pending.Bytes()[s.scanFrom:], "\r\n")
 	if index < 0 {
-		s.scanFrom = len(s.pending)
+		s.scanFrom = s.pending.Len()
 		return 0, false
 	}
 	index += s.scanFrom
 
 	end := index + 1
-	if s.pending[index] == '\r' {
+	if s.pending.Bytes()[index] == '\r' {
 		s.skipLF = true
 	}
 	return end, true

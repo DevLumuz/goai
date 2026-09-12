@@ -211,20 +211,28 @@ func TestScanner_VeryLongLine(t *testing.T) {
 }
 
 func TestScanner_LineExceedsMaxSize(t *testing.T) {
-	// A single line larger than MaxLineSize must be rejected with an error,
-	// not silently consumed (DoS protection).
-	oversized := strings.Repeat("x", MaxLineSize+1)
-	input := "data: " + oversized + "\n"
-	s := NewScanner(strings.NewReader(input))
-
-	data, ok := s.Next()
-	if ok {
-		t.Errorf("expected ok=false for oversized line, got data len=%d", len(data))
-	}
-	if err := s.Err(); err == nil {
-		t.Fatal("expected Err() to report oversized line, got nil")
-	} else if !strings.Contains(err.Error(), "exceeds") {
-		t.Errorf("expected size-limit error, got: %v", err)
+	// Reject oversized lines both when the terminator arrives and while still
+	// waiting for one, so an unterminated stream cannot bypass the size limit.
+	oversized := "data: " + strings.Repeat("x", MaxLineSize+1)
+	for _, tc := range []struct {
+		name   string
+		suffix string
+	}{
+		{"terminated", "\n"},
+		{"unterminated", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := NewScanner(strings.NewReader(oversized + tc.suffix))
+			if data, ok := s.Next(); ok {
+				t.Errorf("expected ok=false for oversized line, got data len=%d", len(data))
+			}
+			if err := s.Err(); err == nil || !strings.Contains(err.Error(), "exceeds") {
+				t.Fatalf("Err() = %v, want size-limit error", err)
+			}
+			if _, ok := s.Next(); ok {
+				t.Fatal("Next() returned data after size error")
+			}
+		})
 	}
 }
 
@@ -539,5 +547,78 @@ func TestScanner_NextEvent_EventExceedsMaxSize(t *testing.T) {
 	}
 	if _, ok := s.NextEvent(); ok {
 		t.Fatal("NextEvent() returned an event on repeat call after size error")
+	}
+}
+
+// chunkReader models transport reads that split lines and CRLF pairs.
+type chunkReader struct {
+	io.Reader
+	size int
+}
+
+func (r chunkReader) Read(p []byte) (int, error) {
+	return r.Reader.Read(p[:min(len(p), r.size)])
+}
+
+func TestScanner_RetainsResultsAcrossReads(t *testing.T) {
+	large := strings.Repeat("x", 8192)
+	input := "\xef\xbb\xbfevent: first\r\ndata: " + large + "\r\n\r\nevent: second\rdata: small\r\r"
+	for _, size := range []int{1, 7, 4096} {
+		s := NewScanner(chunkReader{strings.NewReader(input), size})
+		first, ok := s.NextEvent()
+		if !ok {
+			t.Fatalf("read size %d: missing first event: %v", size, s.Err())
+		}
+		second, ok := s.NextEvent()
+		if !ok || second.Type != "second" || string(second.Data) != "small" {
+			t.Fatalf("read size %d: second event = %#v, %v", size, second, s.Err())
+		}
+		if _, ok := s.NextEvent(); ok || s.Err() != nil {
+			t.Fatalf("read size %d: unexpected final event or error: %v", size, s.Err())
+		}
+		if first.Type != "first" || string(first.Data) != large {
+			t.Fatalf("read size %d: earlier event changed after later reads", size)
+		}
+	}
+
+	s := NewScanner(chunkReader{strings.NewReader(large + "\r\nsmall\nlast"), 7})
+	first, ok := s.NextLine()
+	if !ok {
+		t.Fatal("missing first line")
+	}
+	for _, want := range []string{"small", "last"} {
+		if got, ok := s.NextLine(); !ok || got != want {
+			t.Fatalf("NextLine() = %q, %v; want %q", got, ok, want)
+		}
+	}
+	if first != large {
+		t.Fatal("earlier line changed after later reads")
+	}
+}
+
+func BenchmarkScannerNextEvent(b *testing.B) {
+	payload := strings.Repeat("x", 128)
+	input := strings.Repeat("event: delta\ndata: "+payload+"\n\n", 1024)
+	for _, tc := range []struct {
+		name string
+		size int
+	}{{"fragmented", 64}, {"buffered", 4096}} {
+		b.Run(tc.name, func(b *testing.B) {
+			b.ReportAllocs()
+			b.SetBytes(int64(len(input)))
+			for b.Loop() {
+				s := NewScanner(chunkReader{strings.NewReader(input), tc.size})
+				count := 0
+				for event, ok := s.NextEvent(); ok; event, ok = s.NextEvent() {
+					if event.Type != "delta" || string(event.Data) != payload {
+						b.Fatal("event changed")
+					}
+					count++
+				}
+				if count != 1024 || s.Err() != nil {
+					b.Fatalf("events = %d, err = %v", count, s.Err())
+				}
+			}
+		})
 	}
 }

@@ -5035,3 +5035,17 @@ func TestDoStream_ResponseFormat_ToolToText(t *testing.T) {
 		t.Errorf("FinishReason = %q, want stop", finishReason)
 	}
 }
+
+func BenchmarkParseConverseResponseMultipart(b *testing.B) {
+	text := strings.Repeat("x", 64)
+	block := `{"text":"` + text + `"}`
+	body := []byte(`{"output":{"message":{"content":[` + strings.Repeat(block+",", 511) + block + `]}},"stopReason":"end_turn"}`)
+	want := strings.Repeat(text, 512)
+	b.ReportAllocs()
+	for b.Loop() {
+		got, err := parseConverseResponse(body)
+		if err != nil || got.Text != want {
+			b.Fatal("response text changed")
+		}
+	}
+}

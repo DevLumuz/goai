@@ -124,17 +124,24 @@ closeAll:
 	// Complete truncated keywords and numbers.
 	result = completeTrailing(result)
 
-	// Close open containers.
+	if len(stack) == 0 {
+		return result
+	}
+	// Only the innermost container can have an incomplete trailing entry.
+	// Append all closers at once instead of copying the prefix at every depth.
+	result = trimTrailingIncomplete(result)
+	var closed strings.Builder
+	closed.Grow(len(result) + len(stack))
+	closed.WriteString(result)
 	for i := len(stack) - 1; i >= 0; i-- {
-		result = trimTrailingIncomplete(result)
 		if stack[i] == '{' {
-			result += "}"
+			closed.WriteByte('}')
 		} else {
-			result += "]"
+			closed.WriteByte(']')
 		}
 	}
 
-	return result
+	return closed.String()
 }
 
 // completeTrailing completes truncated JSON keywords and numbers.
