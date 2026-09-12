@@ -151,7 +151,7 @@ goai.WithStopWhen(func(steps []goai.StepResult) bool {
 The predicate receives a SHALLOW clone of goai's internal steps slice:
 
 - **Top-level slice**: safe to reslice / append / zero. Mutations stay local.
-- **Nested slices** (`StepResult.ToolCalls`, `StepResult.ToolResults`, `StepResult.Sources`): aliased into goai's internal state. Writing to an element WILL corrupt the internal record and may produce incorrect `ResponseMessages`.
+- **Nested slices** (`StepResult.Content`, `StepResult.ToolCalls`, `StepResult.ToolResults`, `StepResult.Sources`): aliased into goai's internal state. Writing to an element WILL corrupt the internal record and may produce incorrect `ResponseMessages`. This also applies to maps and slices inside content parts, such as `Part.ProviderOptions` and `Part.ToolInput`.
 
 Treat `StepResult` contents as read-only. goai does not enforce this via deep-clone (prohibitive per-step cost).
 

@@ -475,6 +475,11 @@ func betaForTool(toolType string) string {
 // rather than on every request.
 func collectRequestBetas(body map[string]any) []string {
 	var betas []string
+	if thinking, ok := body["thinking"].(map[string]any); ok {
+		if _, ok := thinking["block_binding"]; ok {
+			betas = append(betas, betaThinkingBinding)
+		}
+	}
 	if _, ok := body["context_management"]; ok {
 		betas = append(betas, betaContextManagement)
 	}

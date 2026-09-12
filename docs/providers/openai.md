@@ -171,6 +171,34 @@ result, err := goai.GenerateText(ctx, model,
 - `gpt-5*` (except `gpt-5-chat`) - reasoning enabled
 - `codex-*` - reasoning enabled
 
+### Responses Replay and `phase`
+
+Responses assistant message items retain their server-provided `phase` (such as
+`commentary` or `final_answer`) and item boundaries. GoAI never guesses a phase
+from text or merges distinct message items merely because their phases match.
+
+Use `result.ResponseMessages` for replay instead of rebuilding history from
+`result.Text` and `result.ToolCalls`. These messages preserve the output order,
+including text before and after tool calls. Each text part carries `itemId` and,
+when returned, `phase` in its `ProviderOptions`. The serializer uses `itemId` to
+keep message boundaries and sends `phase` on the corresponding message item.
+
+Direct provider consumers can use `GenerateResult.Content`, the optional ordered
+assistant content snapshot. In streams, text chunks expose item metadata and
+the final `ChunkFinish.Content` carries the completed snapshot; GoAI's tool-loop
+`ChunkStepFinish.Content` and `StepResult.Content` preserve it per step. When a
+provider supplies no ordered content, existing aggregate replay behavior remains
+unchanged. JSON persistence of `ResponseMessages` preserves the metadata.
+
+The same ordered replay is preserved by `GenerateObject` and `StreamObject`,
+including their step hooks. With `WithResponsesStreamDoneCompatibility(true)`,
+completed item events also supply the snapshot when the endpoint terminates
+with `[DONE]`. The final event of a successful multi-step `StreamText` contains
+the last completed step's snapshot, not the concatenation of all steps.
+
+Both `output_text` and `refusal` contribute to the generated `Text` in synchronous
+and streaming APIs. Refusal parts retain their original wire type for replay.
+
 ## Options
 
 | Option | Type | Description |
