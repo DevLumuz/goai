@@ -14,6 +14,10 @@ type MessagesConfig struct {
 	// reasoning_content field on assistant messages.
 	IncludeReasoningContent bool
 
+	// IncludeReasoningDetails enables OpenRouter's reasoning/reasoning_details
+	// replay fields. Structured details take precedence over plaintext reasoning.
+	IncludeReasoningDetails bool
+
 	// FlatInputFile makes PDF parts serialize as the flat
 	// {"type":"input_file","file_data":...} shape (Requesty) instead of the
 	// nested {"type":"file","file":{...}} shape (item 59).
@@ -134,6 +138,33 @@ func ConvertMessagesWithConfig(msgs []provider.Message, system string, cfg Messa
 		}
 		if includeReasoning && len(reasoningParts) > 0 {
 			m["reasoning_content"] = joinText(reasoningParts)
+		}
+		if cfg.IncludeReasoningDetails && msg.Role == provider.RoleAssistant {
+			var details []any
+			// A message-level payload is authoritative; otherwise gather the
+			// per-part payloads in order. Both forms survive JSON persistence.
+			if opts, ok := msg.ProviderOptions["openrouter"].(map[string]any); ok {
+				details = reasoningDetailsArray(opts["reasoning_details"])
+			}
+			if details == nil {
+				for _, part := range msg.Content {
+					if opts, ok := part.ProviderOptions["openrouter"].(map[string]any); ok {
+						if block := reasoningDetailsArray(opts["reasoning_details"]); block != nil {
+							if details == nil {
+								details = []any{}
+							}
+							details = append(details, block...)
+						}
+					}
+				}
+			}
+			if details != nil {
+				m["reasoning_details"] = details
+				delete(m, "reasoning_content")
+			} else if len(reasoningParts) > 0 {
+				m["reasoning"] = joinText(reasoningParts)
+				delete(m, "reasoning_content")
+			}
 		}
 		if len(toolCalls) > 0 {
 			m["tool_calls"] = toolCalls

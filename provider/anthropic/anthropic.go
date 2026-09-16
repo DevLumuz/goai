@@ -51,6 +51,7 @@ const (
 	betaContextManagement = "context-1m-2025-08-07"
 	betaFastMode          = "fast-mode-2026-02-01"
 	betaClaudeCode        = "claude-code-20250219"
+	betaThinkingBinding   = "thinking-binding-controls-2026-08-01"
 )
 
 // anthropicHandledKeys lists provider option keys that are explicitly handled
@@ -534,6 +535,15 @@ func (m *chatModel) buildRequest(params provider.GenerateParams, streaming bool)
 			}
 			if display, ok := tm["display"]; ok {
 				thinkingReq["display"] = display
+			}
+			// Binding-only recovery requests need not specify a thinking type.
+			// The policy is always explicit; never opt callers into drop_block.
+			if binding, ok := tm["blockBinding"].(map[string]any); ok {
+				if behavior, ok := binding["prefixMismatchBehavior"]; ok {
+					thinkingReq["block_binding"] = map[string]any{"prefix_mismatch_behavior": behavior}
+				}
+			} else if binding, ok := tm["block_binding"].(map[string]any); ok {
+				thinkingReq["block_binding"] = maps.Clone(binding)
 			}
 			if len(thinkingReq) > 0 {
 				body["thinking"] = thinkingReq
@@ -1331,6 +1341,30 @@ func extractResponseFormatResult(result *provider.GenerateResult) {
 
 // --- SSE parsing ---
 
+// inputTransformations normalizes the generic SSE JSON value to the same Go
+// type as parseResponse. Null/absent remains nil; an empty array stays non-nil.
+func inputTransformations(value any) ([]map[string]any, error) {
+	if value == nil {
+		return nil, nil
+	}
+	entries, ok := value.([]any)
+	if !ok {
+		return nil, fmt.Errorf("anthropic: input_transformations must be an array")
+	}
+	result := make([]map[string]any, len(entries))
+	for i, entry := range entries {
+		if entry == nil {
+			continue
+		}
+		block, ok := entry.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("anthropic: input_transformations[%d] must be an object", i)
+		}
+		result[i] = block
+	}
+	return result, nil
+}
+
 func parseSSE(ctx context.Context, body io.Reader, out chan<- provider.StreamChunk, isRFMode bool) {
 	defer close(out)
 
@@ -1346,6 +1380,18 @@ func parseSSE(ctx context.Context, body io.Reader, out chan<- provider.StreamChu
 	var usage provider.Usage
 	var responseMeta provider.ResponseMetadata
 	var finishMeta map[string]any // metadata accumulated for ChunkFinish
+	finish := func(reason provider.FinishReason) {
+		usage.TotalTokens = usage.InputTokens + usage.OutputTokens
+		meta := maps.Clone(finishMeta)
+		if meta != nil {
+			responseMeta.ProviderMetadata = maps.Clone(finishMeta)
+			meta["providerMetadata"] = map[string]map[string]any{"anthropic": maps.Clone(finishMeta)}
+		}
+		provider.TrySend(ctx, out, provider.StreamChunk{
+			Type: provider.ChunkFinish, FinishReason: reason, Usage: usage,
+			Response: responseMeta, Metadata: meta,
+		})
+	}
 
 	// Pending server_tool_use ChunkToolCalls keyed by tool_use_id, deferred so
 	// each can be paired with its own result block before emitting. Keyed by ID
@@ -1399,6 +1445,17 @@ func parseSSE(ctx context.Context, body io.Reader, out chan<- provider.StreamChu
 		switch eventType {
 		case "message_start":
 			if msg, ok := event["message"].(map[string]any); ok {
+				transformations, err := inputTransformations(msg["input_transformations"])
+				if err != nil {
+					provider.TrySend(ctx, out, provider.StreamChunk{Type: provider.ChunkError, Error: err})
+					return
+				}
+				if transformations != nil {
+					if finishMeta == nil {
+						finishMeta = map[string]any{}
+					}
+					finishMeta["inputTransformations"] = transformations
+				}
 				if id, ok := msg["id"].(string); ok {
 					responseMeta.ID = id
 				}
@@ -1608,6 +1665,17 @@ func parseSSE(ctx context.Context, body io.Reader, out chan<- provider.StreamChu
 			}
 
 		case "message_delta":
+			transformations, err := inputTransformations(event["input_transformations"])
+			if err != nil {
+				provider.TrySend(ctx, out, provider.StreamChunk{Type: provider.ChunkError, Error: err})
+				return
+			}
+			if transformations != nil {
+				if finishMeta == nil {
+					finishMeta = map[string]any{}
+				}
+				finishMeta["inputTransformations"] = transformations
+			}
 			if delta, ok := event["delta"].(map[string]any); ok {
 				if sr, ok := delta["stop_reason"].(string); ok {
 					// Flush any pending server tool calls before signalling
@@ -1685,15 +1753,7 @@ func parseSSE(ctx context.Context, body io.Reader, out chan<- provider.StreamChu
 			if !flushAllPending() {
 				return
 			}
-			usage.TotalTokens = usage.InputTokens + usage.OutputTokens
-			if !provider.TrySend(ctx, out, provider.StreamChunk{
-				Type:     provider.ChunkFinish,
-				Usage:    usage,
-				Response: responseMeta,
-				Metadata: finishMeta,
-			}) {
-				return
-			}
+			finish("")
 			return
 
 		case "error":
@@ -1706,23 +1766,12 @@ func parseSSE(ctx context.Context, body io.Reader, out chan<- provider.StreamChu
 		if !provider.TrySend(ctx, out, provider.StreamChunk{Type: provider.ChunkError, Error: fmt.Errorf("reading stream: %w", err)}) {
 			return
 		}
-		usage.TotalTokens = usage.InputTokens + usage.OutputTokens
-		provider.TrySend(ctx, out, provider.StreamChunk{
-			Type:         provider.ChunkFinish,
-			FinishReason: "error",
-			Usage:        usage,
-			Response:     responseMeta,
-		})
+		finish(provider.FinishError)
 		return
 	}
 	// Clean EOF without message_stop: emit finish with accumulated usage and response meta.
 	_ = flushAllPending()
-	usage.TotalTokens = usage.InputTokens + usage.OutputTokens
-	provider.TrySend(ctx, out, provider.StreamChunk{
-		Type:     provider.ChunkFinish,
-		Usage:    usage,
-		Response: responseMeta,
-	})
+	finish("")
 }
 
 func handleStreamError(ctx context.Context, data string, event map[string]any, out chan<- provider.StreamChunk) {
@@ -1978,6 +2027,11 @@ func accumulateStreamedMessage(ctx context.Context, body io.Reader) ([]byte, err
 			if cm, ok := event["context_management"]; ok {
 				message["context_management"] = cm
 			}
+			// Like parseSSE, a null value carries no new snapshot. Only an
+			// explicit empty array clears diagnostics received in message_start.
+			if transformations, ok := event["input_transformations"]; ok && transformations != nil {
+				message["input_transformations"] = transformations
+			}
 
 		case "message_stop":
 			if !messageStarted {
@@ -2072,8 +2126,9 @@ func parseResponse(body []byte) (*provider.GenerateResult, error) {
 				EndCharIndex    int     `json:"end_char_index,omitempty"`
 			} `json:"citations,omitempty"`
 		} `json:"content"`
-		StopReason string `json:"stop_reason"`
-		Usage      *struct {
+		StopReason           string           `json:"stop_reason"`
+		InputTransformations []map[string]any `json:"input_transformations"`
+		Usage                *struct {
 			InputTokens              int `json:"input_tokens"`
 			OutputTokens             int `json:"output_tokens"`
 			CacheReadInputTokens     int `json:"cache_read_input_tokens"`
@@ -2319,6 +2374,12 @@ func parseResponse(body []byte) (*provider.GenerateResult, error) {
 	}
 
 	// Attach provider metadata to response.
+	if resp.InputTransformations != nil {
+		if providerMeta == nil {
+			providerMeta = map[string]any{}
+		}
+		providerMeta["inputTransformations"] = resp.InputTransformations
+	}
 	if providerMeta != nil {
 		result.Response.ProviderMetadata = providerMeta
 		result.ProviderMetadata = map[string]map[string]any{
@@ -2362,28 +2423,32 @@ func (m *chatModel) doHTTP(ctx context.Context, body map[string]any, toolBetas .
 	req.Header.Set("Content-Type", "application/json")
 
 	req.Header.Set("anthropic-version", apiVersion)
-	// Merge base betas with tool-specific betas.
-	allBetas := betaFeatures
-	if len(toolBetas) > 0 {
-		seen := make(map[string]bool)
-		for b := range strings.SplitSeq(betaFeatures, ",") {
-			seen[b] = true
-		}
-		for _, b := range toolBetas {
-			if !seen[b] {
-				allBetas += "," + b
-				seen[b] = true
-			}
-		}
-	}
-	req.Header.Set("anthropic-beta", allBetas)
-
+	req.Header.Set("anthropic-beta", betaFeatures)
 	for k, v := range m.opts.headers {
 		req.Header.Set(k, v)
 	}
 	for k, v := range reqHeaders {
 		req.Header.Set(k, v)
 	}
+	// Caller headers can replace the baseline, but must not remove betas
+	// required by features explicitly present in this request.
+	allBetas := req.Header.Get("anthropic-beta")
+	if len(toolBetas) > 0 {
+		seen := make(map[string]bool)
+		for b := range strings.SplitSeq(allBetas, ",") {
+			seen[strings.TrimSpace(b)] = true
+		}
+		for _, b := range toolBetas {
+			if !seen[b] {
+				if allBetas != "" {
+					allBetas += ","
+				}
+				allBetas += b
+				seen[b] = true
+			}
+		}
+	}
+	req.Header.Set("anthropic-beta", allBetas)
 
 	// Set auth header last so per-request headers can never override it.
 	switch m.opts.authMode {

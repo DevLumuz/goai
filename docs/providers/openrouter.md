@@ -46,6 +46,38 @@ if err != nil {
 fmt.Println(result.Text)
 ```
 
+## Reasoning Replay
+
+Both `GenerateText` and `StreamText` preserve OpenRouter reasoning in
+`result.ResponseMessages`. Pass these messages back unchanged with
+`goai.WithMessages` (along with the original conversation and the next user
+turn). The built-in tool loop does this automatically.
+
+- Plain `reasoning` and its `reasoning_content` alias are replayed as `reasoning`.
+- Structured `reasoning_details` takes precedence over plaintext. The full
+  sequence retains types, IDs, indices, formats, signatures, opaque encrypted
+  data, and unknown fields, including an explicitly empty array.
+- Streaming text/summary fragments are assembled within their block boundaries;
+  distinct encrypted entries are never merged. Late signatures are included in
+  the completed replay payload. Reasoning text is not emitted twice when a
+  delta contains both plain reasoning and structured details.
+
+For structured reasoning in direct provider calls, replay
+`GenerateResult.ReasoningParts`, not just the aggregate `Reasoning` string.
+String-only responses can still use `Reasoning`. Structured details live in reasoning-part
+`ProviderOptions["openrouter"]["reasoning_details"]` and in
+`ProviderMetadata["openrouter"]["reasoning_details"]`. Streaming emits visible
+reasoning deltas followed by a metadata-only reasoning chunk containing the
+completed details, also exposed in the final chunk's provider metadata.
+Persisted JSON representations are supported. Explicit message-level
+`ProviderOptions["openrouter"]["reasoning_details"]` takes precedence over
+part-level payloads.
+
+This enables replay, not thinking itself: model-specific reasoning budgets and
+enablement remain caller-controlled via provider options. Other compatible
+providers do not send OpenRouter fields unless their request configuration opts in.
+See [OpenRouter's reasoning contract](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens).
+
 ## Options
 
 | Option | Type | Description |

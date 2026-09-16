@@ -114,6 +114,45 @@ result, err := goai.GenerateText(ctx, model,
 
 Thinking types: `"enabled"` (with `budgetTokens`), `"adaptive"`, `"disabled"`.
 
+### Thinking Prefix Binding and Diagnostics
+
+For models that validate preserved thinking against the conversation prefix,
+the caller can explicitly choose whether a prefix mismatch should fail or drop
+the affected blocks:
+
+```go
+goai.WithProviderOptions(map[string]any{
+    "thinking": map[string]any{
+        "type": "adaptive",
+        "blockBinding": map[string]any{
+            "prefixMismatchBehavior": "drop_block", // or "error"
+        },
+    },
+})
+```
+
+GoAI maps this to `thinking.block_binding.prefix_mismatch_behavior` and adds
+`thinking-binding-controls-2026-08-01` to `anthropic-beta`. The wire spelling
+`thinking.block_binding` is also accepted. Binding-only requests can omit
+`thinking.type`. No mismatch policy or binding beta is enabled by default.
+
+Read service-side changes from
+`result.ProviderMetadata["anthropic"]["inputTransformations"]` or
+`result.Response.ProviderMetadata["inputTransformations"]`. Each entry retains
+the original `type`, `reason`, `path`, and any additional fields. This covers
+JSON responses, automatic SSE transport for `GenerateText`, and `StreamText`.
+The concrete Go type is `[]map[string]any` in all three paths. An explicitly
+empty array is a non-nil empty slice. An absent or null value supplies no new
+snapshot: a null delta does not clear earlier diagnostics, but an empty array does.
+For direct `DoStream` consumers, the final chunk exposes the same data in
+`Metadata["inputTransformations"]` and nested `Metadata["providerMetadata"]`.
+The final `message_delta` snapshot supersedes `message_start` diagnostics when
+both are present; an empty array is preserved rather than treated as absent.
+
+`drop_block` is an explicit reasoning downgrade, not a guarantee that edited
+history is exact. GoAI does not remove the original blocks from caller history.
+See [Anthropic's preserved-thinking contract](https://platform.claude.com/docs/en/build-with-claude/preserved-thinking).
+
 ## Options
 
 | Option | Type | Description |
@@ -128,7 +167,7 @@ Thinking types: `"enabled"` (with `budgetTokens`), `"adaptive"`, `"disabled"`.
 
 | Key | Type | Description |
 |-----|------|-------------|
-| `thinking` | `map[string]any` | Extended thinking config: `{type, budgetTokens}`. |
+| `thinking` | `map[string]any` | Thinking config: `{type, budgetTokens, display, blockBinding}`. |
 | `disableParallelToolUse` | `bool` | Disable parallel tool calls. |
 | `effort` | `string` | Output quality level: `"low"`, `"medium"`, `"high"`, `"max"`. |
 | `speed` | `string` | Inference speed: `"fast"`, `"standard"`. |
@@ -295,7 +334,7 @@ def := anthropic.Tools.CodeExecution_20250522()
 
 - **Prompt caching**: When `goai.WithPromptCaching(true)` is set, the system prompt receives `cache_control: {type: "ephemeral"}`. Message-level caching is controlled via `ProviderOptions["anthropic"]["cacheControl"]` on the message, or via `Part.CacheControl` on individual content parts.
 - **Structured output**: Anthropic does not natively support JSON Schema `response_format` on all models. GoAI uses a synthetic tool injection pattern - a hidden tool with the schema is injected, and the model is forced to call it. For models that support native `output_format` (claude-opus-4-5/4-6/4-7/4-8, claude-sonnet-4-5/4-6, claude-haiku-4-5, claude-opus-5, claude-sonnet-5, claude-fable-5, claude-mythos-5), set `structuredOutputMode: "outputFormat"` to use native `output_format` instead.
-- **Beta headers**: Provider-defined tools automatically add the required `anthropic-beta` header values. The base beta feature (`interleaved-thinking-2025-05-14`) is always included; `claude-code-20250219` is only added when a feature actually needs it (e.g. container execution).
+- **Beta headers**: Provider-defined tools and enabled request features automatically add the required `anthropic-beta` values. The default baseline is `interleaved-thinking-2025-05-14`; custom headers can replace this baseline but required feature betas are merged back in. `claude-code-20250219` is only added when a feature actually needs it (e.g. container execution).
 - **Default max tokens**: 16384 when not explicitly set via `goai.WithMaxOutputTokens()`.
 - **Auth header**: Uses `x-api-key` (not `Authorization: Bearer`), matching Anthropic's API convention.
 - **Input modalities**: Supports text, images (base64), and PDF documents (base64).

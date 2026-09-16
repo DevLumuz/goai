@@ -180,6 +180,11 @@ type GenerateParams struct {
 
 // GenerateResult is the response from a non-streaming generation.
 type GenerateResult struct {
+	// Content is the ordered assistant output, including provider-specific part
+	// options needed for replay. When non-nil it takes precedence over rebuilding
+	// content from Text, ReasoningParts and ToolCalls.
+	Content []Part
+
 	// Text is the generated text content.
 	Text string
 
@@ -249,6 +254,10 @@ type StreamResult struct {
 // StreamChunk is a single event in a streaming response.
 // The Type field determines which other fields are populated.
 type StreamChunk struct {
+	// Content is an optional complete ordered assistant output snapshot on
+	// ChunkFinish (or a GoAI ChunkStepFinish), not a text delta.
+	Content []Part
+
 	// Type identifies this chunk's kind.
 	Type StreamChunkType
 
