@@ -76,9 +76,6 @@ type RequestConfig struct {
 	// reasoning_content field. Providers must opt in when their API requires it.
 	IncludeReasoningContent bool
 
-	// IncludeReasoningDetails enables OpenRouter's structured reasoning replay.
-	IncludeReasoningDetails bool
-
 	// UseMaxCompletionTokens is a provider policy: when true the request body
 	// always emits max_completion_tokens (renaming any max_tokens); when false
 	// it always emits max_tokens. Nil keeps the modelID heuristic
@@ -131,7 +128,6 @@ func BuildRequest(params provider.GenerateParams, modelID string, streaming bool
 	// Messages
 	body["messages"] = ConvertMessagesWithConfig(params.Messages, params.System, MessagesConfig{
 		IncludeReasoningContent: cfg.IncludeReasoningContent,
-		IncludeReasoningDetails: cfg.IncludeReasoningDetails,
 		FlatInputFile:           cfg.FlatInputFile,
 	})
 
@@ -412,11 +408,10 @@ type streamResponse struct {
 	Choices []struct {
 		Index int `json:"index"`
 		Delta struct {
-			Role             string           `json:"role,omitempty"`
-			Content          json.RawMessage  `json:"content,omitempty"`
-			ReasoningContent string           `json:"reasoning_content,omitempty"`
-			Reasoning        string           `json:"reasoning,omitempty"`
-			ReasoningDetails []map[string]any `json:"reasoning_details"`
+			Role             string          `json:"role,omitempty"`
+			Content          json.RawMessage `json:"content,omitempty"`
+			ReasoningContent string          `json:"reasoning_content,omitempty"`
+			Reasoning        string          `json:"reasoning,omitempty"`
 			ToolCalls        []struct {
 				Index    int    `json:"index"`
 				ID       string `json:"id,omitempty"`
@@ -496,7 +491,6 @@ func ParseStream(ctx context.Context, scanner *sse.Scanner, out chan<- provider.
 	providerMeta := map[string]any{}
 	var citations []string
 	var citationsSize int64
-	var reasoningDetails reasoningDetailsAccumulator
 
 	for {
 		data, ok := scanner.Next()
@@ -575,10 +569,6 @@ func ParseStream(ctx context.Context, scanner *sse.Scanner, out chan<- provider.
 
 		choice := resp.Choices[0]
 		delta := choice.Delta
-		if err := reasoningDetails.add(delta.ReasoningDetails); err != nil {
-			provider.TrySend(ctx, out, provider.StreamChunk{Type: provider.ChunkError, Error: err})
-			return
-		}
 
 		// Reasoning content -- emitted before text: a delta can carry both
 		// fields at the reasoning→answer transition, and reasoning always
@@ -590,10 +580,6 @@ func ParseStream(ctx context.Context, scanner *sse.Scanner, out chan<- provider.
 			}
 		} else if delta.Reasoning != "" {
 			if !provider.TrySend(ctx, out, provider.StreamChunk{Type: provider.ChunkReasoning, Text: delta.Reasoning}) {
-				return
-			}
-		} else if text := reasoningDetailsText(delta.ReasoningDetails); text != "" {
-			if !provider.TrySend(ctx, out, provider.StreamChunk{Type: provider.ChunkReasoning, Text: text}) {
 				return
 			}
 		}
@@ -790,13 +776,6 @@ func ParseStream(ctx context.Context, scanner *sse.Scanner, out chan<- provider.
 		return
 	}
 
-	if reasoningDetails.details != nil {
-		// This metadata-only chunk carries the completed payload (including
-		// late signatures) without duplicating any visible reasoning deltas.
-		if !provider.TrySend(ctx, out, provider.StreamChunk{Type: provider.ChunkReasoning, Metadata: map[string]any{"openrouter": map[string]any{"reasoning_details": reasoningDetails.details}}}) {
-			return
-		}
-	}
 	chunk := provider.StreamChunk{
 		Type:     provider.ChunkFinish,
 		Usage:    usage,
@@ -821,17 +800,6 @@ func ParseStream(ctx context.Context, scanner *sse.Scanner, out chan<- provider.
 			chunk.Metadata["sources"] = sources
 		}
 	}
-	if reasoningDetails.details != nil {
-		if chunk.Metadata == nil {
-			chunk.Metadata = map[string]any{}
-		}
-		pm, _ := chunk.Metadata["providerMetadata"].(map[string]map[string]any)
-		if pm == nil {
-			pm = map[string]map[string]any{}
-		}
-		pm["openrouter"] = map[string]any{"reasoning_details": reasoningDetails.details}
-		chunk.Metadata["providerMetadata"] = pm
-	}
 	if !provider.TrySend(ctx, out, chunk) {
 		return
 	}
@@ -845,11 +813,10 @@ type chatResponse struct {
 	Choices []struct {
 		Index   int `json:"index"`
 		Message struct {
-			Role             string           `json:"role"`
-			Content          json.RawMessage  `json:"content"`
-			ReasoningContent string           `json:"reasoning_content,omitempty"`
-			Reasoning        string           `json:"reasoning,omitempty"`
-			ReasoningDetails []map[string]any `json:"reasoning_details"`
+			Role             string          `json:"role"`
+			Content          json.RawMessage `json:"content"`
+			ReasoningContent string          `json:"reasoning_content,omitempty"`
+			Reasoning        string          `json:"reasoning,omitempty"`
 			ToolCalls        []struct {
 				ID       string `json:"id"`
 				Type     string `json:"type"`
@@ -905,14 +872,6 @@ func ParseResponse(body []byte) (*provider.GenerateResult, error) {
 		result.Reasoning = choice.Message.ReasoningContent
 		if result.Reasoning == "" {
 			result.Reasoning = choice.Message.Reasoning
-		}
-		if details := choice.Message.ReasoningDetails; details != nil {
-			if result.Reasoning == "" {
-				result.Reasoning = reasoningDetailsText(details)
-			}
-			meta := map[string]any{"reasoning_details": details}
-			result.ReasoningParts = []provider.Part{{Type: provider.PartReasoning, Text: result.Reasoning, ProviderOptions: map[string]any{"openrouter": meta}}}
-			result.ProviderMetadata = map[string]map[string]any{"openrouter": meta}
 		}
 		result.FinishReason = mapFinishReason(choice.FinishReason)
 
@@ -987,10 +946,7 @@ func ParseResponse(body []byte) (*provider.GenerateResult, error) {
 	}
 
 	if len(providerMeta) > 0 {
-		if result.ProviderMetadata == nil {
-			result.ProviderMetadata = map[string]map[string]any{}
-		}
-		result.ProviderMetadata["openai"] = providerMeta
+		result.ProviderMetadata = map[string]map[string]any{"openai": providerMeta}
 	}
 
 	return result, nil

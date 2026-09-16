@@ -39,7 +39,6 @@ The result of a single generation step in a multi-step tool loop.
 
 ```go
 type StepResult struct {
-    Content      []provider.Part           // Optional ordered assistant output; read-only.
     Number       int                      // 1-based step index.
     Text         string                   // Text generated in this step (excludes reasoning text).
     Reasoning    string                   // Reasoning text for this step when provided by the model.
@@ -52,11 +51,6 @@ type StepResult struct {
     Sources      []provider.Source        // Citations from this step.
 }
 ```
-
-`Content` preserves provider-native part order and replay metadata. It is exposed
-in completed steps and `OnStepFinish` callbacks, including single-step streams.
-Treat its slice elements and nested `ProviderOptions` maps as read-only: callbacks
-and stop predicates can share this data with internal replay state.
 
 ### TextStream
 
@@ -517,7 +511,6 @@ Response from a non-streaming generation.
 
 ```go
 type GenerateResult struct {
-    Content          []Part                       // Optional complete ordered assistant output for replay.
     Text             string                       // Generated text.
     Reasoning        string                       // Generated reasoning text.
     ReasoningParts   []Part                       // Reasoning blocks with preserved boundaries/metadata.
@@ -529,11 +522,6 @@ type GenerateResult struct {
     ProviderMetadata map[string]map[string]any     // Provider-specific response data.
 }
 ```
-
-When `Content` is non-nil, it takes precedence over reconstructing assistant
-messages from `Text`, `ReasoningParts`, and `ToolCalls`. A nil slice retains the
-aggregate fallback; a non-nil empty slice explicitly represents empty content.
-`GenerateText` and `GenerateObject` preserve it in their response messages.
 
 ### StreamResult
 
@@ -551,7 +539,6 @@ A single event in a streaming response. The `Type` field determines which other 
 
 ```go
 type StreamChunk struct {
-    Content      []Part             // Optional complete snapshot on ChunkFinish / GoAI ChunkStepFinish.
     Type         StreamChunkType    // Chunk kind.
     Text         string             // Content (for ChunkText, ChunkReasoning).
     ToolCallID   string             // Tool call fields (for ChunkToolCall, ChunkToolCallStreamStart).
@@ -565,12 +552,6 @@ type StreamChunk struct {
     StoppedBy    StopCause          // How the tool loop terminated.
 }
 ```
-
-`Content` is a snapshot, not a delta. On a successful multi-step text stream,
-the final `ChunkFinish.Content` represents only the last completed step; use
-`ChunkStepFinish.Content` for each step. `StreamObject` preserves provider finish
-content in its response messages and step hook. Do not mutate snapshot parts or
-their nested metadata while the stream or SDK callbacks may still use them.
 
 ### StreamChunkType
 

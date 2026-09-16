@@ -120,9 +120,8 @@ type ObjectResult[T any] struct {
 	//   messages = append(messages, result.ResponseMessages...)
 	//
 	// Nil when the response has no content.
-	// Provider-supplied ordered Content is preserved, including any reasoning
-	// parts it contains. Without Content, only aggregate text/tool calls are used;
-	// StreamObject does not separately accumulate reasoning chunks.
+	// Reasoning parts are not included (GenerateObject uses non-streaming DoGenerate,
+	// and StreamObject does not capture reasoning chunks).
 	ResponseMessages []provider.Message
 
 	// Steps contains results from each generation step (for multi-step tool loops).
@@ -150,7 +149,6 @@ type ObjectStream[T any] struct {
 
 	// Accumulated state.
 	text             strings.Builder
-	content          []provider.Part
 	finishReason     provider.FinishReason
 	usage            provider.Usage
 	response         provider.ResponseMetadata
@@ -204,8 +202,8 @@ func (os *ObjectStream[T]) Result() (*ObjectResult[T], error) {
 
 	text := os.text.String()
 	var responseMessages []provider.Message
-	if text != "" || len(os.content) > 0 {
-		responseMessages = buildFinalAssistantMessages(text, nil, nil, os.content)
+	if text != "" {
+		responseMessages = buildFinalAssistantMessages(text, nil, nil)
 	}
 
 	if os.finalObject == nil {
@@ -273,7 +271,6 @@ func (os *ObjectStream[T]) consume(partialOut chan<- *T) {
 		defer func() {
 			stepResult := StepResult{
 				Number:           1,
-				Content:          os.content,
 				Text:             os.text.String(),
 				FinishReason:     os.finishReason,
 				Usage:            os.usage,
@@ -323,7 +320,6 @@ func (os *ObjectStream[T]) consume(partialOut chan<- *T) {
 			}
 
 		case provider.ChunkFinish:
-			os.content = chunk.Content
 			os.finishReason = chunk.FinishReason
 			os.usage = chunk.Usage
 			os.response = chunk.Response
@@ -501,7 +497,6 @@ func GenerateObject[T any](ctx context.Context, model provider.LanguageModel, op
 
 		stepResult := StepResult{
 			Number:           step,
-			Content:          result.Content,
 			Text:             result.Text,
 			ToolCalls:        result.ToolCalls,
 			FinishReason:     result.FinishReason,
@@ -562,7 +557,7 @@ func GenerateObject[T any](ctx context.Context, model provider.LanguageModel, op
 			onAfterExecute:  o.OnAfterToolExecute,
 			onPanic:         o.OnPanic,
 		})
-		params.Messages = appendToolRoundTrip(params.Messages, result.Text, nil, result.ToolCalls, toolMessages, result.Content)
+		params.Messages = appendToolRoundTrip(params.Messages, result.Text, nil, result.ToolCalls, toolMessages)
 	}
 
 	// MaxSteps exhausted with tool calls still pending - no structured output produced.

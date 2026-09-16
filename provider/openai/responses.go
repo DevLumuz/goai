@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"maps"
 	"slices"
 	"strings"
 
@@ -341,51 +340,36 @@ func convertToResponsesInput(msgs []provider.Message) []map[string]any {
 			var items []map[string]any
 			var message map[string]any
 			var messageContent []map[string]any
-			var messageID, messagePhase string
-			appendText := func(part provider.Part) {
-				id, _ := part.ProviderOptions["itemId"].(string)
-				phase, _ := part.ProviderOptions["phase"].(string)
-				if part.Text == "" && phase == "" && id == "" {
+			appendText := func(text string) {
+				if text == "" {
 					return
 				}
-				if id != messageID || phase != messagePhase {
-					message = nil
-				}
 				if message == nil {
-					messageContent = nil
-					messageID, messagePhase = id, phase
 					message = map[string]any{
 						"type":    "message",
 						"role":    "assistant",
 						"content": messageContent,
 					}
-					if phase != "" {
-						message["phase"] = phase
-					}
 					items = append(items, message)
 				}
-				content := map[string]any{
+				messageContent = append(messageContent, map[string]any{
 					"type":        "output_text",
-					"text":        part.Text,
+					"text":        text,
 					"annotations": []any{},
-				}
-				if refusal, _ := part.ProviderOptions["refusal"].(bool); refusal {
-					content = map[string]any{"type": "refusal", "refusal": part.Text}
-				}
-				messageContent = append(messageContent, content)
+				})
 				message["content"] = messageContent
 			}
 
 			for _, part := range msg.Content {
 				switch part.Type {
 				case provider.PartText:
-					appendText(part)
+					appendText(part.Text)
 				case provider.PartReasoning:
 					if item, ok := reasoningInputItem(part); ok {
 						message = nil
 						items = append(items, item)
 					} else if part.Text != "" {
-						appendText(provider.Part{Text: part.Text})
+						appendText(part.Text)
 					}
 				case provider.PartToolCall:
 					message = nil
@@ -516,9 +500,6 @@ type responsesReasoning struct {
 	lastSummary int
 }
 
-// Bound the completed output retained for client-side replay across a stream.
-var maxResponsesReplayBytes = 64 << 20
-
 func activeReasoningForEvent(active map[int]*responsesReasoning, current int, itemID string) (int, *responsesReasoning) {
 	for index, reasoning := range active {
 		if reasoning.canonicalID == itemID {
@@ -554,37 +535,6 @@ func streamResponses(ctx context.Context, body io.ReadCloser, out chan<- provide
 	streamResponsesWithConfig(ctx, body, out, defaultResponsesStreamConfig())
 }
 
-// responsesReplayContent assembles the authoritative terminal output, or the
-// completed item events when a gateway omits that output (including [DONE]).
-func responsesReplayContent(items []json.RawMessage, completed map[int]json.RawMessage, phases map[string]string) ([]provider.Part, error) {
-	if len(items) == 0 {
-		for _, index := range slices.Sorted(maps.Keys(completed)) {
-			items = append(items, completed[index])
-		}
-	}
-	if len(items) == 0 {
-		return nil, nil
-	}
-	payload, err := json.Marshal(map[string]any{"output": items})
-	if err != nil {
-		return nil, err
-	}
-	parsed, err := parseResponsesResult(payload)
-	if err != nil {
-		return nil, err
-	}
-	for i := range parsed.Content {
-		part := &parsed.Content[i]
-		if part.Type == provider.PartText && part.ProviderOptions["phase"] == nil {
-			id, _ := part.ProviderOptions["itemId"].(string)
-			if phase := phases[id]; phase != "" {
-				part.ProviderOptions["phase"] = phase
-			}
-		}
-	}
-	return parsed.Content, nil
-}
-
 func streamResponsesWithConfig(
 	ctx context.Context,
 	body io.ReadCloser,
@@ -604,31 +554,7 @@ func streamResponsesWithConfig(
 
 	activeTools := make(map[int]*responsesToolCall)
 	activeReasoning := make(map[int]*responsesReasoning)
-	messageOptions := make(map[int]map[string]any)
-	messagePhases := make(map[string]string)
-	outputItems := make(map[int]json.RawMessage)
-	outputItemsBytes := 0
 	currentReasoningIdx := -1
-	finish := func(items []json.RawMessage, response provider.ResponseMetadata, reason provider.FinishReason) {
-		content, err := responsesReplayContent(items, outputItems, messagePhases)
-		if err != nil {
-			trySendResponsesError(ctx, out, err)
-			return
-		}
-		// Both supported terminal forms must flush complete buffered tool args.
-		for _, index := range slices.Sorted(maps.Keys(activeTools)) {
-			active := activeTools[index]
-			if remaining := active.args.String(); remaining != "" {
-				if !provider.TrySend(ctx, out, provider.StreamChunk{Type: provider.ChunkToolCall, ToolCallID: active.id, ToolName: active.name, ToolInput: remaining}) {
-					return
-				}
-			}
-		}
-		if !provider.TrySend(ctx, out, provider.StreamChunk{Type: provider.ChunkStepFinish, FinishReason: reason}) {
-			return
-		}
-		provider.TrySend(ctx, out, provider.StreamChunk{Type: provider.ChunkFinish, Content: content, Usage: usage, Response: response})
-	}
 
 	for {
 		var read responsesReadResult
@@ -668,7 +594,7 @@ func streamResponsesWithConfig(
 
 		if data == "[DONE]" {
 			if config.allowDone {
-				finish(nil, provider.ResponseMetadata{}, mapResponsesFinishReason("response.completed", "", hasFunctionCall))
+				provider.TrySend(ctx, out, provider.StreamChunk{Type: provider.ChunkFinish, Usage: usage})
 				return
 			}
 			trySendResponsesError(ctx, out, newStreamProtocolError(read.event.Type, "stream ended with [DONE] before a terminal event", nil))
@@ -683,9 +609,7 @@ func streamResponsesWithConfig(
 		switch eventType {
 		case "response.output_text.delta":
 			var ev struct {
-				Delta       *string `json:"delta"`
-				OutputIndex int     `json:"output_index"`
-				ItemID      string  `json:"item_id"`
+				Delta *string `json:"delta"`
 			}
 			if err := decodeResponsesEvent(eventType, read.event.Data, &ev); err != nil {
 				trySendResponsesError(ctx, out, err)
@@ -696,11 +620,7 @@ func streamResponsesWithConfig(
 				return
 			}
 			if *ev.Delta != "" {
-				metadata := maps.Clone(messageOptions[ev.OutputIndex])
-				if metadata == nil && ev.ItemID != "" {
-					metadata = map[string]any{"itemId": ev.ItemID}
-				}
-				if !provider.TrySend(ctx, out, provider.StreamChunk{Type: provider.ChunkText, Text: *ev.Delta, Metadata: metadata}) {
+				if !provider.TrySend(ctx, out, provider.StreamChunk{Type: provider.ChunkText, Text: *ev.Delta}) {
 					return
 				}
 			}
@@ -826,7 +746,6 @@ func streamResponsesWithConfig(
 					ID     string  `json:"id"`
 					CallID string  `json:"call_id"`
 					Name   string  `json:"name"`
-					Phase  string  `json:"phase"`
 				} `json:"item"`
 			}
 			ev.OutputIndex = new(int)
@@ -847,12 +766,6 @@ func streamResponsesWithConfig(
 				return
 			}
 			switch *ev.Item.Type {
-			case "message":
-				messageOptions[*ev.OutputIndex] = map[string]any{"itemId": ev.Item.ID}
-				if ev.Item.Phase != "" {
-					messageOptions[*ev.OutputIndex]["phase"] = ev.Item.Phase
-					messagePhases[ev.Item.ID] = ev.Item.Phase
-				}
 			case "function_call":
 				hasFunctionCall = true
 				activeTools[*ev.OutputIndex] = &responsesToolCall{
@@ -975,12 +888,6 @@ func streamResponsesWithConfig(
 			itemType := ""
 			if itemHead != nil {
 				itemType = *itemHead.Type
-				outputItemsBytes += len(ev.Item) - len(outputItems[*ev.OutputIndex])
-				if outputItemsBytes > maxResponsesReplayBytes {
-					trySendResponsesError(ctx, out, newStreamProtocolError(eventType, "replay output exceeds size limit", nil))
-					return
-				}
-				outputItems[*ev.OutputIndex] = ev.Item
 			}
 			switch itemType {
 			case "reasoning":
@@ -1083,9 +990,8 @@ func streamResponsesWithConfig(
 		case "response.completed", "response.incomplete":
 			var ev struct {
 				Response *struct {
-					ID                string            `json:"id"`
-					Model             string            `json:"model"`
-					Output            []json.RawMessage `json:"output"`
+					ID                string `json:"id"`
+					Model             string `json:"model"`
 					IncompleteDetails *struct {
 						Reason string `json:"reason"`
 					} `json:"incomplete_details"`
@@ -1126,12 +1032,38 @@ func streamResponsesWithConfig(
 				usage.InputTokens -= usage.CacheReadTokens
 			}
 
+			// Flush remaining tool call args.
+			for _, active := range activeTools {
+				if remaining := active.args.String(); remaining != "" {
+					if !provider.TrySend(ctx, out, provider.StreamChunk{
+						Type:       provider.ChunkToolCall,
+						ToolCallID: active.id,
+						ToolName:   active.name,
+						ToolInput:  remaining,
+					}) {
+						return
+					}
+				}
+			}
+
 			var incompleteReason string
 			if ev.Response.IncompleteDetails != nil {
 				incompleteReason = ev.Response.IncompleteDetails.Reason
 			}
 			finishReason := mapResponsesFinishReason(eventType, incompleteReason, hasFunctionCall)
-			finish(ev.Response.Output, provider.ResponseMetadata{ID: ev.Response.ID, Model: ev.Response.Model}, finishReason)
+			if !provider.TrySend(ctx, out, provider.StreamChunk{
+				Type:         provider.ChunkStepFinish,
+				FinishReason: finishReason,
+			}) {
+				return
+			}
+			if !provider.TrySend(ctx, out, provider.StreamChunk{
+				Type:     provider.ChunkFinish,
+				Usage:    usage,
+				Response: provider.ResponseMetadata{ID: ev.Response.ID, Model: ev.Response.Model},
+			}) {
+				return
+			}
 			return
 
 		case "response.failed":
@@ -1244,12 +1176,10 @@ type responsesResult struct {
 
 	Output []struct {
 		Type    string `json:"type"`
-		Phase   string `json:"phase"`
 		Role    string `json:"role"`
 		Content []struct {
 			Type        string                `json:"type"`
 			Text        string                `json:"text"`
-			Refusal     string                `json:"refusal"`
 			Annotations []responsesAnnotation `json:"annotations,omitempty"`
 			Logprobs    *json.RawMessage      `json:"logprobs,omitempty"`
 		} `json:"content,omitempty"`
@@ -1341,20 +1271,8 @@ func parseResponsesResult(body []byte) (*provider.GenerateResult, error) {
 		switch item.Type {
 		case "message":
 			for _, c := range item.Content {
-				if c.Type == "output_text" || c.Type == "refusal" {
-					opts := map[string]any{"itemId": item.ID}
-					if item.Phase != "" {
-						opts["phase"] = item.Phase
-					}
-					text := c.Text
-					if c.Type == "refusal" {
-						text = c.Refusal
-						opts["refusal"] = true
-					}
-					result.Content = append(result.Content, provider.Part{Type: provider.PartText, Text: text, ProviderOptions: opts})
-					if text != "" {
-						textParts = append(textParts, text)
-					}
+				if c.Type == "output_text" && c.Text != "" {
+					textParts = append(textParts, c.Text)
 				}
 				// Item 11: extract annotations (url_citation).
 				for _, ann := range c.Annotations {
@@ -1378,7 +1296,6 @@ func parseResponsesResult(body []byte) (*provider.GenerateResult, error) {
 			}
 		case "function_call":
 			hasFunctionCall = true
-			result.Content = append(result.Content, provider.Part{Type: provider.PartToolCall, ToolCallID: item.CallID, ToolName: item.Name, ToolInput: json.RawMessage(item.Arguments)})
 			result.ToolCalls = append(result.ToolCalls, provider.ToolCall{
 				ID:    item.CallID,
 				Name:  item.Name,
@@ -1399,7 +1316,6 @@ func parseResponsesResult(body []byte) (*provider.GenerateResult, error) {
 			}
 			if len(itemText) > 0 || item.EncryptedContent != "" {
 				reasoningItems = append(reasoningItems, openAIReasoningPart(item.ID, strings.Join(itemText, summarySeparator), item.EncryptedContent))
-				result.Content = append(result.Content, reasoningItems[len(reasoningItems)-1])
 			}
 		default:
 			if isServerExecutedItem(item.Type) && i < len(rawOutput.Output) {
@@ -1418,7 +1334,6 @@ func parseResponsesResult(body []byte) (*provider.GenerateResult, error) {
 							"rawItem":          raw,
 						},
 					})
-					result.Content = append(result.Content, provider.Part{Type: provider.PartToolCall, ToolCallID: id, ToolName: name, ProviderOptions: map[string]any{"providerExecuted": true, "rawItem": raw}})
 				}
 			}
 		}

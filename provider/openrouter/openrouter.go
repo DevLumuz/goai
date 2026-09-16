@@ -108,8 +108,7 @@ func Chat(modelID string, opts ...Option) provider.LanguageModel {
 		Capabilities:      chatCaps,
 		WarnPromptCaching: true,
 		RequestConfig: openaicompat.RequestConfig{
-			IncludeStreamOptions:    true,
-			IncludeReasoningDetails: true,
+			IncludeStreamOptions: true,
 			// OpenRouter is a router to many upstreams; some only accept
 			// max_tokens, so max_completion_tokens is NOT forced for every
 			// model. Callers opt in via WithUseMaxCompletionTokens.

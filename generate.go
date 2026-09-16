@@ -87,11 +87,6 @@ type TextResult struct {
 
 // StepResult is the result of a single generation step in a tool loop.
 type StepResult struct {
-	// Content preserves ordered provider output for replay when supplied.
-	// Treat parts and nested metadata as read-only; hooks and stop predicates
-	// may share them with internal replay state.
-	Content []provider.Part
-
 	// Number is the 1-based step index.
 	Number int
 
@@ -293,7 +288,6 @@ type TextStream struct {
 	stepSources    []provider.Source
 	reasoning      reasoningAccumulator
 	reasoningParts []provider.Part
-	content        []provider.Part
 
 	// responseMessages is set by the streamWithToolLoop goroutine before doneCh closes.
 	responseMessages []provider.Message
@@ -423,7 +417,6 @@ func (ts *TextStream) consume(rawOut chan<- provider.StreamChunk, textOut chan<-
 		defer func() {
 			stepResult := StepResult{
 				Number:           1,
-				Content:          ts.content,
 				Text:             ts.stepText.String(),
 				ToolCalls:        ts.toolCalls,
 				FinishReason:     ts.finishReason,
@@ -502,7 +495,6 @@ func (ts *TextStream) consume(rawOut chan<- provider.StreamChunk, textOut chan<-
 					stepProviderMeta = pm
 				}
 				ts.steps = append(ts.steps, StepResult{
-					Content:          chunk.Content,
 					Number:           ts.currentStep,
 					Text:             ts.stepText.String(),
 					Reasoning:        reasoningText(stepReasoning),
@@ -557,9 +549,6 @@ func (ts *TextStream) consume(rawOut chan<- provider.StreamChunk, textOut chan<-
 			}
 
 		case provider.ChunkFinish:
-			if chunk.Content != nil {
-				ts.content = chunk.Content
-			}
 			// Direct assignment (not addUsage): ChunkFinish carries authoritative total usage.
 			ts.usage = chunk.Usage
 			ts.finishReason = chunk.FinishReason
@@ -644,7 +633,6 @@ func (ts *TextStream) buildResult() *TextResult {
 		// Single-step fallback (no multi-step ChunkStepFinish received, but data exists).
 		stepReasoning := reasoningText(ts.reasoningParts)
 		result.Steps = []StepResult{{
-			Content:          ts.content,
 			Number:           1,
 			Text:             ts.stepText.String(),
 			Reasoning:        stepReasoning,
@@ -666,9 +654,9 @@ func (ts *TextStream) buildResult() *TextResult {
 	if ts.responseMessages != nil {
 		// Multi-step: set by streamWithToolLoop goroutine.
 		result.ResponseMessages = ts.responseMessages
-	} else if text != "" || len(result.ToolCalls) > 0 || len(ts.content) > 0 || len(ts.reasoningParts) > 0 {
+	} else if text != "" || len(result.ToolCalls) > 0 {
 		// Single-step: build a simple assistant message from the result.
-		result.ResponseMessages = buildFinalAssistantMessages(ts.stepText.String(), result.ToolCalls, ts.reasoningParts, ts.content)
+		result.ResponseMessages = buildFinalAssistantMessages(ts.stepText.String(), result.ToolCalls, ts.reasoningParts)
 	}
 	return result
 }
@@ -827,7 +815,6 @@ func streamWithToolLoop(ctx context.Context, model provider.LanguageModel, o opt
 		var totalUsage provider.Usage
 		var lastFinishReason provider.FinishReason
 		var lastResponse provider.ResponseMetadata
-		var lastContent []provider.Part
 		var lastReasoning []provider.Part
 		var steps []StepResult
 		var stepsExhausted bool
@@ -1011,7 +998,6 @@ func streamWithToolLoop(ctx context.Context, model provider.LanguageModel, o opt
 
 			// --- Build StepResult, fire OnStepFinish ---
 			stepResult := StepResult{
-				Content:          ds.content,
 				Number:           step,
 				Text:             ds.text,
 				Reasoning:        ds.reasoningText,
@@ -1025,7 +1011,6 @@ func streamWithToolLoop(ctx context.Context, model provider.LanguageModel, o opt
 			steps = append(steps, stepResult)
 			totalUsage = addUsage(totalUsage, ds.usage)
 			lastResponse = ds.response
-			lastContent = ds.content
 			lastReasoning = ds.reasoning
 			setPreviousResponseID(&params, ds.response)
 
@@ -1056,7 +1041,6 @@ func streamWithToolLoop(ctx context.Context, model provider.LanguageModel, o opt
 			// since there is no dedicated field for it on StreamChunk.
 			provider.TrySend(ctx, out, provider.StreamChunk{
 				Type:         provider.ChunkStepFinish,
-				Content:      ds.content,
 				FinishReason: ds.finishReason,
 				Usage:        ds.usage,
 				Response:     ds.response,
@@ -1124,7 +1108,7 @@ func streamWithToolLoop(ctx context.Context, model provider.LanguageModel, o opt
 			}
 
 			// --- Append messages for next step ---
-			params.Messages = appendToolRoundTrip(params.Messages, ds.text, ds.reasoning, ds.toolCalls, toolMsgs, ds.content)
+			params.Messages = appendToolRoundTrip(params.Messages, ds.text, ds.reasoning, ds.toolCalls, toolMsgs)
 			// Clear ToolChoice so model can freely respond on subsequent steps.
 			// Set on every iteration for simplicity; idempotent after step 1.
 			params.ToolChoice = ""
@@ -1160,7 +1144,6 @@ func streamWithToolLoop(ctx context.Context, model provider.LanguageModel, o opt
 		// Emit final ChunkFinish with total usage and last step Response metadata.
 		provider.TrySend(ctx, out, provider.StreamChunk{
 			Type:         provider.ChunkFinish,
-			Content:      lastContent,
 			FinishReason: lastFinishReason,
 			Usage:        totalUsage,
 			Response:     lastResponse,
@@ -1423,7 +1406,6 @@ func GenerateText(ctx context.Context, model provider.LanguageModel, opts ...Opt
 		}
 
 		stepResult := StepResult{
-			Content:          result.Content,
 			Number:           step,
 			Text:             result.Text,
 			Reasoning:        result.Reasoning,
@@ -1509,7 +1491,7 @@ func GenerateText(ctx context.Context, model provider.LanguageModel, opts ...Opt
 		// Append assistant message with tool calls + tool result messages.
 		// For server-executed tools (no client tool calls), pass reasoning
 		// so the model's thinking is preserved in the continuation.
-		params.Messages = appendToolRoundTrip(params.Messages, result.Text, lastReasoning, result.ToolCalls, toolMessages, result.Content)
+		params.Messages = appendToolRoundTrip(params.Messages, result.Text, lastReasoning, result.ToolCalls, toolMessages)
 		setPreviousResponseID(&params, result.Response)
 
 		// WithStopWhen (Vercel parity): evaluated AFTER this step's LLM call
@@ -2033,12 +2015,7 @@ func appendToolRoundTrip(
 	reasoning []provider.Part,
 	toolCalls []provider.ToolCall,
 	toolMsgs []provider.Message,
-	content ...[]provider.Part,
 ) []provider.Message {
-	if len(content) > 0 && content[0] != nil {
-		msgs = append(msgs, buildFinalAssistantMessages(text, toolCalls, reasoning, content[0])...)
-		return append(msgs, toolMsgs...)
-	}
 	var parts []provider.Part
 	// Reasoning first (before text and tool_use). Clone ProviderOptions to avoid
 	// aliasing between params.Messages and ResponseMessages.
@@ -2129,7 +2106,7 @@ func buildResponseMessages(roundTripDelta []provider.Message, steps []StepResult
 	}
 	last := steps[len(steps)-1]
 	if len(roundTripDelta) == 0 {
-		return buildFinalAssistantMessages(last.Text, last.ToolCalls, reasoning, last.Content)
+		return buildFinalAssistantMessages(last.Text, last.ToolCalls, reasoning)
 	}
 	msgs := mergeToolMessages(roundTripDelta)
 	if len(last.ToolCalls) > 0 {
@@ -2139,7 +2116,7 @@ func buildResponseMessages(roundTripDelta []provider.Message, steps []StepResult
 	}
 	// Natural termination: last step produced text with no tool calls - its
 	// assistant message is NOT yet in the delta.
-	finalMsg := buildFinalAssistantMessages(last.Text, last.ToolCalls, reasoning, last.Content)
+	finalMsg := buildFinalAssistantMessages(last.Text, last.ToolCalls, reasoning)
 	return append(msgs, finalMsg...)
 }
 
@@ -2165,21 +2142,9 @@ func mergeToolMessages(msgs []provider.Message) []provider.Message {
 
 // buildFinalAssistantMessages builds a single assistant message from text, tool calls,
 // and/or reasoning parts. Returns nil when all inputs are empty.
-// A non-nil ordered content snapshot takes precedence over the aggregate fields.
-// Otherwise reasoning parts are placed first so providers that require thinking blocks
+// Reasoning parts are placed first so providers that require thinking blocks
 // (e.g. Bedrock with extended thinking) see them before text/tool_use content.
-func buildFinalAssistantMessages(text string, toolCalls []provider.ToolCall, reasoning []provider.Part, content ...[]provider.Part) []provider.Message {
-	if len(content) > 0 && content[0] != nil {
-		parts := slices.Clone(content[0])
-		for i := range parts {
-			parts[i].ProviderOptions = maps.Clone(parts[i].ProviderOptions)
-			parts[i].ToolInput = slices.Clone(parts[i].ToolInput)
-		}
-		if len(parts) == 0 {
-			return nil
-		}
-		return []provider.Message{{Role: provider.RoleAssistant, Content: parts}}
-	}
+func buildFinalAssistantMessages(text string, toolCalls []provider.ToolCall, reasoning []provider.Part) []provider.Message {
 	var parts []provider.Part
 	parts = append(parts, reasoning...)
 	if text != "" {
@@ -2203,7 +2168,6 @@ func buildFinalAssistantMessages(text string, toolCalls []provider.ToolCall, rea
 }
 
 type drainResult struct {
-	content          []provider.Part
 	text             string          // text-only (ChunkText), used for appendToolRoundTrip
 	reasoning        []provider.Part // reasoning/thinking parts, echoed back for providers that require it (e.g. Bedrock)
 	reasoningText    string          // consolidated reasoning text (PartReasoning), surfaced via StepResult.Reasoning
@@ -2293,7 +2257,6 @@ func drainStep(
 			}
 		case provider.ChunkFinish:
 			reasoning.flush()
-			dr.content = chunk.Content
 			// Terminal chunk. Use direct assignment for usage (not addUsage) to avoid
 			// double-counting when providers emit both ChunkStepFinish and ChunkFinish
 			// with the same accumulated usage (e.g., Google).
