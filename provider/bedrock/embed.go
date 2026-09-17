@@ -134,23 +134,44 @@ func (m *embeddingModel) doTitanEmbed(ctx context.Context, value string, params 
 		return nil, fmt.Errorf("parsing response: %w", err)
 	}
 
-	// When embeddingTypes includes "binary" (or another non-float type), Titan
-	// V2 returns embeddings under "embeddingsByType" instead of "embedding".
-	var embeddings [][]float64
+	// Titan V2 also returns "embeddingsByType", the only place the vector lives
+	// when embeddingTypes omits "float". Unlike Cohere's map it holds ONE flat
+	// vector per type, never a matrix.
+	embedding := result.Embedding
 	if len(result.EmbeddingsByType) > 0 {
-		embeddings, err = parseTypedEmbeddings(result.EmbeddingsByType)
+		embedding, err = parseTitanEmbeddingsByType(result.EmbeddingsByType)
 		if err != nil {
 			return nil, err
 		}
-	} else {
-		embeddings = [][]float64{result.Embedding}
 	}
 
 	return &provider.EmbedResult{
-		Embeddings: embeddings,
+		Embeddings: [][]float64{embedding},
 		Usage:      provider.Usage{InputTokens: result.InputTextTokenCount, TotalTokens: result.InputTextTokenCount},
 		Response:   provider.ResponseMetadata{Model: m.id},
 	}, nil
+}
+
+// parseTitanEmbeddingsByType parses Titan V2's "embeddingsByType":
+// {"float": [0.1, ...], "binary": [0, 1, ...]}. Each value is a single flat
+// vector (binary as one 0/1 integer per dimension); "float" is preferred.
+func parseTitanEmbeddingsByType(raw json.RawMessage) ([]float64, error) {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return nil, errors.New("bedrock: unrecognised titan embeddingsByType format")
+	}
+	for _, key := range []string{"float", "binary"} {
+		val, ok := m[key]
+		if !ok || len(val) == 0 || string(val) == "null" {
+			continue
+		}
+		var v []float64
+		if err := json.Unmarshal(val, &v); err != nil {
+			return nil, fmt.Errorf("bedrock: parsing titan %s embedding: %w", key, err)
+		}
+		return v, nil
+	}
+	return nil, errors.New("bedrock: no embeddings in titan embeddingsByType")
 }
 
 // isTitanV2 returns true for Titan V2 which supports normalize/dimensions/embeddingTypes.
