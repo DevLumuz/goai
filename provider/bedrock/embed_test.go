@@ -1012,6 +1012,45 @@ func TestEmbedding_TitanV2_EmbeddingsByType_InvalidFloat(t *testing.T) {
 	}
 }
 
+// TestEmbedding_TitanV2_MalformedResponse covers the response-parse error path
+// in doTitanEmbed: a body that is not JSON at all.
+func TestEmbedding_TitanV2_MalformedResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`not-json`))
+	}))
+	defer server.Close()
+
+	model := Embedding("amazon.titan-embed-text-v2:0",
+		WithAccessKey("AK"),
+		WithSecretKey("SK"),
+		WithBaseURL(server.URL),
+	)
+	if _, err := model.DoEmbed(t.Context(), []string{"hi"}, provider.EmbedParams{}); err == nil {
+		t.Fatal("expected error for malformed Titan response, got nil")
+	}
+}
+
+// TestParseTitanEmbeddingsByType_NotAnObject covers the top-level unmarshal
+// error: embeddingsByType that is not a type-keyed object.
+func TestParseTitanEmbeddingsByType_NotAnObject(t *testing.T) {
+	_, err := parseTitanEmbeddingsByType(json.RawMessage(`["not-an-object"]`))
+	if err == nil {
+		t.Fatal("expected error for non-object embeddingsByType, got nil")
+	}
+}
+
+// TestParseTitanEmbeddingsByType_NoUsableType covers the exhausted-loop error:
+// an object carrying neither "float" nor "binary" (and a null value, which is
+// skipped rather than returned as an empty vector).
+func TestParseTitanEmbeddingsByType_NoUsableType(t *testing.T) {
+	for _, raw := range []string{`{"int8":[1,2]}`, `{"float":null}`, `{}`} {
+		if _, err := parseTitanEmbeddingsByType(json.RawMessage(raw)); err == nil {
+			t.Errorf("%s: expected error, got nil", raw)
+		}
+	}
+}
+
 // TestParseTypedEmbeddings_FloatUnmarshalError covers the "float" case
 // json.Unmarshal error (lines 371-373).
 func TestParseTypedEmbeddings_FloatUnmarshalError(t *testing.T) {
