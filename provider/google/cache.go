@@ -56,6 +56,9 @@ type CachedContent struct {
 
 // Create stores a new cachedContents resource and returns its name + expiry.
 func (c *CacheClient) Create(ctx context.Context, in CachedContentInput) (CachedContent, error) {
+	if in.TTL <= 0 {
+		return CachedContent{}, fmt.Errorf("google: cachedContents TTL must be positive, got %s", in.TTL)
+	}
 	tools, toolConfig, err := buildToolsAndConfig(in.Tools, in.ToolChoice, in.ProviderOptions)
 	if err != nil {
 		return CachedContent{}, err
@@ -85,6 +88,9 @@ func (c *CacheClient) Create(ctx context.Context, in CachedContentInput) (Cached
 // Renew extends the TTL of an existing resource via PATCH and returns the new
 // expiry. name is the value returned by Create.
 func (c *CacheClient) Renew(ctx context.Context, name string, ttl time.Duration) (CachedContent, error) {
+	if ttl <= 0 {
+		return CachedContent{}, fmt.Errorf("google: cachedContents TTL must be positive, got %s", ttl)
+	}
 	reqURL, err := c.resourceURL(name, "?updateMask=ttl")
 	if err != nil {
 		return CachedContent{}, err
@@ -93,6 +99,10 @@ func (c *CacheClient) Renew(ctx context.Context, name string, ttl time.Duration)
 	return c.send(ctx, http.MethodPatch, reqURL, body)
 }
 
+// maxCacheResponseBytes bounds a cachedContents response body to defend against
+// a malicious or misbehaving server returning an unbounded payload.
+const maxCacheResponseBytes = 1 << 20 // 1 MiB
+
 func (c *CacheClient) send(ctx context.Context, method, url string, body any) (CachedContent, error) {
 	resp, err := doGoogleJSON(ctx, c.opts, method, url, body, nil)
 	if err != nil {
@@ -100,9 +110,12 @@ func (c *CacheClient) send(ctx context.Context, method, url string, body any) (C
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	data, err := io.ReadAll(resp.Body)
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxCacheResponseBytes+1))
 	if err != nil {
 		return CachedContent{}, fmt.Errorf("reading cachedContents response: %w", err)
+	}
+	if len(data) > maxCacheResponseBytes {
+		return CachedContent{}, fmt.Errorf("google: cachedContents response exceeds %d bytes", maxCacheResponseBytes)
 	}
 	var out struct {
 		Name       string `json:"name"`

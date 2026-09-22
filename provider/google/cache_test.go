@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -300,7 +301,7 @@ func TestCacheClient_ResponseParsingErrors(t *testing.T) {
 			defer server.Close()
 
 			c := NewCacheClient(WithAPIKey("k"), WithBaseURL(server.URL))
-			_, err := c.Create(context.Background(), CachedContentInput{Model: "m"})
+			_, err := c.Create(context.Background(), CachedContentInput{Model: "m", TTL: time.Hour})
 			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 				t.Fatalf("Create() err = %v, want substring %q", err, tt.wantErr)
 			}
@@ -344,8 +345,40 @@ func (errorBodyTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 func TestCacheClient_BodyReadError(t *testing.T) {
 	httpClient := &http.Client{Transport: errorBodyTransport{}}
 	c := NewCacheClient(WithAPIKey("k"), WithHTTPClient(httpClient))
-	_, err := c.Create(context.Background(), CachedContentInput{Model: "m"})
+	_, err := c.Create(context.Background(), CachedContentInput{Model: "m", TTL: time.Hour})
 	if err == nil || !strings.Contains(err.Error(), "reading cachedContents response") {
 		t.Fatalf("expected body read error, got: %v", err)
+	}
+}
+
+func TestCacheClient_RejectsNonPositiveTTL(t *testing.T) {
+	c := NewCacheClient(WithAPIKey("k"))
+	if _, err := c.Create(context.Background(), CachedContentInput{Model: "m", TTL: 0}); err == nil || !strings.Contains(err.Error(), "TTL must be positive") {
+		t.Fatalf("Create(TTL=0) err = %v, want positive-TTL error", err)
+	}
+	if _, err := c.Create(context.Background(), CachedContentInput{Model: "m", TTL: -time.Minute}); err == nil || !strings.Contains(err.Error(), "TTL must be positive") {
+		t.Fatalf("Create(negative TTL) err = %v, want positive-TTL error", err)
+	}
+	if _, err := c.Renew(context.Background(), "cachedContents/x", 0); err == nil || !strings.Contains(err.Error(), "TTL must be positive") {
+		t.Fatalf("Renew(TTL=0) err = %v, want positive-TTL error", err)
+	}
+}
+
+type oversizedBodyTransport struct{}
+
+func (oversizedBodyTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(strings.Repeat("x", maxCacheResponseBytes+1))),
+		Header:     make(http.Header),
+	}, nil
+}
+
+func TestCacheClient_RejectsOversizedResponse(t *testing.T) {
+	httpClient := &http.Client{Transport: oversizedBodyTransport{}}
+	c := NewCacheClient(WithAPIKey("k"), WithHTTPClient(httpClient))
+	_, err := c.Create(context.Background(), CachedContentInput{Model: "m", TTL: time.Hour})
+	if err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("expected size-limit error, got: %v", err)
 	}
 }

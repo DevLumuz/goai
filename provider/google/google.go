@@ -111,19 +111,11 @@ func WithVertex(project, location string) Option {
 	}
 }
 
-func withVertex(project, location string) Option {
-	return WithVertex(project, location)
-}
-
 // WithVertexBaseURL overrides the base URL used in Vertex AI mode.
 func WithVertexBaseURL(url string) Option {
 	return func(o *options) {
 		o.vertexBaseURL = url
 	}
-}
-
-func withVertexBaseURL(url string) Option {
-	return WithVertexBaseURL(url)
 }
 
 func newVertexChat(modelID string, cfg geminichat.Config) provider.LanguageModel {

@@ -2440,8 +2440,8 @@ func TestChat_Vertex_AuthHeaderCannotBeOverridden(t *testing.T) {
 
 	model := Chat("gemini-2.5-pro",
 		WithTokenSource(provider.StaticToken("oauth-token")),
-		withVertex("my-proj", "us-central1"),
-		withVertexBaseURL(server.URL),
+		WithVertex("my-proj", "us-central1"),
+		WithVertexBaseURL(server.URL),
 		WithHeaders(map[string]string{"Authorization": "Bearer spoofed"}),
 	)
 	_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
@@ -4402,8 +4402,8 @@ func TestChat_Vertex_Generate_BearerAuth(t *testing.T) {
 
 	model := Chat("gemini-2.5-pro",
 		WithTokenSource(provider.StaticToken("oauth-token")),
-		withVertex("my-proj", "us-central1"),
-		withVertexBaseURL(server.URL))
+		WithVertex("my-proj", "us-central1"),
+		WithVertexBaseURL(server.URL))
 
 	res, err := model.DoGenerate(context.Background(), provider.GenerateParams{
 		Messages: []provider.Message{{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}}},
@@ -4421,7 +4421,7 @@ func TestChat_Vertex_IgnoresGeminiEnvironment(t *testing.T) {
 	t.Setenv("GEMINI_API_KEY", "gemini-fallback-key")
 	t.Setenv("GOOGLE_GENERATIVE_AI_BASE_URL", "https://gemini.example.test")
 
-	model := Chat("gemini-2.5-pro", withVertex("my-proj", "us-central1"))
+	model := Chat("gemini-2.5-pro", WithVertex("my-proj", "us-central1"))
 	vertexModel, ok := model.(*vertexChatModel)
 	if !ok {
 		t.Fatalf("Chat() type = %T, want *vertexChatModel", model)
@@ -4436,7 +4436,7 @@ func TestChat_Vertex_IgnoresGeminiEnvironment(t *testing.T) {
 
 func TestChat_Vertex_RejectsAPIKey(t *testing.T) {
 	model := Chat("gemini-2.5-pro",
-		withVertex("my-proj", "us-central1"),
+		WithVertex("my-proj", "us-central1"),
 		WithAPIKey("gemini-api-key"))
 
 	_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
@@ -4458,10 +4458,10 @@ func TestChat_Vertex_AuthOptionPrecedence(t *testing.T) {
 
 	t.Run("token source after API key wins", func(t *testing.T) {
 		model := Chat("gemini-2.5-pro",
-			withVertex("my-proj", "us-central1"),
+			WithVertex("my-proj", "us-central1"),
 			WithAPIKey("gemini-api-key"),
 			WithTokenSource(provider.StaticToken("oauth-token")),
-			withVertexBaseURL(server.URL))
+			WithVertexBaseURL(server.URL))
 		if _, err := model.DoGenerate(t.Context(), provider.GenerateParams{
 			Messages: []provider.Message{{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}}},
 		}); err != nil {
@@ -4471,10 +4471,10 @@ func TestChat_Vertex_AuthOptionPrecedence(t *testing.T) {
 
 	t.Run("API key after token source is rejected", func(t *testing.T) {
 		model := Chat("gemini-2.5-pro",
-			withVertex("my-proj", "us-central1"),
+			WithVertex("my-proj", "us-central1"),
 			WithTokenSource(provider.StaticToken("oauth-token")),
 			WithAPIKey("gemini-api-key"),
-			withVertexBaseURL(server.URL))
+			WithVertexBaseURL(server.URL))
 		_, err := model.DoGenerate(t.Context(), provider.GenerateParams{
 			Messages: []provider.Message{{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}}},
 		})
@@ -4485,7 +4485,7 @@ func TestChat_Vertex_AuthOptionPrecedence(t *testing.T) {
 }
 
 func TestChat_Vertex_MissingTokenFailsGenerateAndStream(t *testing.T) {
-	model := Chat("gemini-2.5-pro", withVertex("my-proj", "us-central1"))
+	model := Chat("gemini-2.5-pro", WithVertex("my-proj", "us-central1"))
 	params := provider.GenerateParams{
 		Messages: []provider.Message{{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}}},
 	}
@@ -4501,7 +4501,7 @@ func TestVertexOptionsRejectedByNonChatModels(t *testing.T) {
 	t.Setenv("GOOGLE_GENERATIVE_AI_API_KEY", "")
 	t.Setenv("GEMINI_API_KEY", "")
 	opts := []Option{
-		withVertex("my-proj", "us-central1"),
+		WithVertex("my-proj", "us-central1"),
 		WithTokenSource(provider.StaticToken("oauth-token")),
 	}
 	want := "WithVertex is only supported by Chat"
@@ -4533,7 +4533,7 @@ func TestVertexOptionsRejectedByNonChatModels(t *testing.T) {
 func TestChat_Vertex_DoesNotAdvertiseFileUpload(t *testing.T) {
 	model := Chat("gemini-2.5-pro",
 		WithTokenSource(provider.StaticToken("oauth-token")),
-		withVertex("my-proj", "us-central1"))
+		WithVertex("my-proj", "us-central1"))
 
 	if _, ok := model.(provider.FileUploadCapableModel); ok {
 		t.Fatalf("Vertex model type %T must not implement FileUploadCapableModel", model)
@@ -4549,7 +4549,7 @@ func TestChat_Vertex_DoesNotAdvertiseFileUpload(t *testing.T) {
 func TestChat_Vertex_WithBaseURLDoesNotOverrideVertexEndpoint(t *testing.T) {
 	model := Chat("gemini-2.5-pro",
 		WithTokenSource(provider.StaticToken("oauth-token")),
-		withVertex("my-proj", "us-central1"),
+		WithVertex("my-proj", "us-central1"),
 		WithBaseURL("https://gemini.example.test"))
 	vertexModel := model.(*vertexChatModel)
 
@@ -4565,9 +4565,9 @@ func TestChat_Vertex_WithBaseURLDoesNotOverrideVertexEndpoint(t *testing.T) {
 
 func TestChat_VertexBaseURLIsNormalizedAndIgnoredOutsideVertex(t *testing.T) {
 	vertex := Chat("gemini-2.5-pro",
-		withVertex("my-proj", "us-central1"),
+		WithVertex("my-proj", "us-central1"),
 		WithTokenSource(provider.StaticToken("oauth-token")),
-		withVertexBaseURL("https://vertex.example.test/models/"))
+		WithVertexBaseURL("https://vertex.example.test/models/"))
 	got, err := vertex.(*vertexChatModel).model.endpointURL("generateContent", "")
 	if err != nil {
 		t.Fatal(err)
@@ -4579,7 +4579,7 @@ func TestChat_VertexBaseURLIsNormalizedAndIgnoredOutsideVertex(t *testing.T) {
 	gemini := Chat("gemini-2.5-flash",
 		WithAPIKey("api-key"),
 		WithBaseURL("https://gemini.example.test"),
-		withVertexBaseURL("https://vertex.example.test/models"))
+		WithVertexBaseURL("https://vertex.example.test/models"))
 	got, err = gemini.(*chatModel).endpointURL("generateContent", "")
 	if err != nil {
 		t.Fatal(err)
@@ -4594,7 +4594,7 @@ func TestChat_VertexBaseURLIsNormalizedAndIgnoredOutsideVertex(t *testing.T) {
 func TestChat_Vertex_InvalidEndpointErrors(t *testing.T) {
 	model := Chat("gemini-2.5-pro",
 		WithTokenSource(provider.StaticToken("token")),
-		withVertex("invalid/project", "us-central1"))
+		WithVertex("invalid/project", "us-central1"))
 
 	params := provider.GenerateParams{
 		Messages: []provider.Message{{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}}},
@@ -4630,8 +4630,8 @@ func TestChat_Vertex_BearerAuth(t *testing.T) {
 	// Vertex endpoint overrides are separate from Gemini API base URL overrides.
 	model := Chat("gemini-2.5-pro",
 		WithTokenSource(provider.StaticToken("oauth-token")),
-		withVertex("my-proj", "us-central1"),
-		withVertexBaseURL(server.URL))
+		WithVertex("my-proj", "us-central1"),
+		WithVertexBaseURL(server.URL))
 
 	res, err := model.DoStream(context.Background(), provider.GenerateParams{
 		Messages: []provider.Message{{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}}},
