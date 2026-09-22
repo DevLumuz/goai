@@ -343,10 +343,11 @@ func (t *sigV4CapturingTransport) RoundTrip(req *http.Request) (*http.Response, 
 	}, nil
 }
 
-// TestSigV4_SignsWirePath verifies the SigV4 canonical URI is byte-identical to
-// the path Go transmits on the wire (req.URL.EscapedPath()), not a re-encoded
-// form. Model IDs like "anthropic.claude-sonnet-4-20250514-v1:0" keep the raw
-// ':' on the wire; signing a re-encoded path produced a wrong signature.
+// TestSigV4_SignsWirePath verifies the SigV4 canonical URI is the RFC 3986
+// URI-encoded path, not the raw bytes Go transmits on the wire. Model IDs like
+// "anthropic.claude-sonnet-4-20250514-v1:0" keep a raw ':' on the wire, but AWS
+// computes the canonical URI from the URI-encoded form ("%3A0"); signing the
+// raw wire path produced a signature AWS rejects.
 func TestSigV4_SignsWirePath(t *testing.T) {
 	const (
 		modelID   = "anthropic.claude-sonnet-4-20250514-v1:0"
@@ -354,7 +355,8 @@ func TestSigV4_SignsWirePath(t *testing.T) {
 	)
 	transport := &sigV4CapturingTransport{}
 	model := Chat(modelID,
-		WithAccessKey("AKIAIOSFODNN7EXAMPLE"),
+		// Redacted by VibeFlow for security reasons: the secret value on the line below was replaced before it reached the AI model, so this file does NOT contain the real value. Put the real value back by hand if this file needs it.
+		WithAccessKey("[REDACTED:aws-access-token]"),
 		WithSecretKey(secretKey),
 		WithRegion("us-west-2"),
 		WithHTTPClient(&http.Client{Transport: transport}),
@@ -379,10 +381,15 @@ func TestSigV4_SignsWirePath(t *testing.T) {
 	if !strings.HasPrefix(auth, "AWS4-HMAC-SHA256 ") {
 		t.Fatalf("Authorization = %q", auth)
 	}
-	// Recompute the signature from the request using req.URL.EscapedPath() and
-	// require it to match the shipped Authorization header: canonical == wire.
+	// The canonical URI must be the URI-encoded path ("%3A0"), so the signature
+	// recomputed from that form must match the shipped Authorization header.
 	if got, want := recomputeSigV4Signature(t, transport.req, secretKey), parseSigV4Signature(t, auth); got != want {
-		t.Errorf("signature mismatch: recomputed-from-EscapedPath = %s, shipped = %s (canonical URI must match wire path)", got, want)
+		t.Errorf("signature mismatch: recomputed-from-encoded-path = %s, shipped = %s (canonical URI must be the URI-encoded path)", got, want)
+	}
+	// Guard against a regression: signing the raw wire path must NOT match, so
+	// this test would fail if the canonical URI were taken from EscapedPath().
+	if got, want := recomputeSigV4SignatureWire(t, transport.req, secretKey), parseSigV4Signature(t, auth); got == want {
+		t.Errorf("signature unexpectedly matches the raw wire path; canonical URI must be URI-encoded")
 	}
 }
 
@@ -400,8 +407,19 @@ func parseSigV4Signature(t *testing.T, auth string) string {
 
 // recomputeSigV4Signature independently recomputes the SigV4 signature for a
 // signed request using the same algorithm as signAWSSigV4, with the canonical
-// URI taken from req.URL.EscapedPath() (the wire path).
+// URI taken from the RFC 3986 URI-encoded path (uriEncodePath(req.URL.Path)).
 func recomputeSigV4Signature(t *testing.T, req *http.Request, secretKey string) string {
+	return recomputeSigV4SignatureWith(t, req, secretKey, uriEncodePath(req.URL.Path))
+}
+
+// recomputeSigV4SignatureWire recomputes the signature using the raw wire path
+// (req.URL.EscapedPath()). It must NOT match the shipped signature, and exists
+// only to prove the canonical URI is not the wire path.
+func recomputeSigV4SignatureWire(t *testing.T, req *http.Request, secretKey string) string {
+	return recomputeSigV4SignatureWith(t, req, secretKey, req.URL.EscapedPath())
+}
+
+func recomputeSigV4SignatureWith(t *testing.T, req *http.Request, secretKey, canonicalURI string) string {
 	t.Helper()
 	auth := req.Header.Get("Authorization")
 
@@ -426,7 +444,7 @@ func recomputeSigV4Signature(t *testing.T, req *http.Request, secretKey string) 
 	}
 	canonicalRequest := strings.Join([]string{
 		"POST",
-		req.URL.EscapedPath(),
+		canonicalURI,
 		req.URL.RawQuery,
 		canonicalHeaders.String(),
 		strings.Join(signedHeaders, ";"),
