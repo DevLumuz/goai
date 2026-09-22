@@ -876,13 +876,15 @@ func signAWSSigV4(req *http.Request, body []byte, accessKey, secretKey, sessionT
 		canonicalHeaders.WriteString(h + ":" + strings.TrimSpace(val) + "\n")
 	}
 
-	// Sign the exact path bytes transmitted on the wire. Go's HTTP transport
-	// sends url.URL.EscapedPath(), so re-encoding req.URL.Path (which is the
-	// DECODED path) would produce a canonical URI that differs from the wire
-	// for model IDs containing reserved chars (e.g. "model:v1:0" → ":0").
+	// AWS SigV4 requires the canonical URI to be the URI-encoded absolute path
+	// (RFC 3986), independent of the bytes Go transmits on the wire. Go leaves
+	// reserved chars such as ':' unescaped in url.URL.EscapedPath() for model
+	// IDs like "amazon.titan-embed-text-v2:0", so signing that raw path
+	// produces a signature AWS rejects. Encode the DECODED path instead, which
+	// yields the canonical "%3A0" AWS computes from the received path.
 	canonicalRequest := strings.Join([]string{
 		"POST",
-		req.URL.EscapedPath(),
+		uriEncodePath(req.URL.Path),
 		req.URL.RawQuery,
 		canonicalHeaders.String(),
 		strings.Join(signedHeaders, ";"),
@@ -903,6 +905,22 @@ func signAWSSigV4(req *http.Request, body []byte, accessKey, secretKey, sessionT
 	auth := fmt.Sprintf("AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s",
 		accessKey, credentialScope, strings.Join(signedHeaders, ";"), signature)
 	req.Header.Set("Authorization", auth)
+}
+
+// uriEncodePath URI-encodes each path segment per AWS SigV4 rules (RFC 3986).
+// Only unreserved characters (A-Z, a-z, 0-9, -, _, ., ~) remain unencoded.
+// Slashes between segments are preserved.
+func uriEncodePath(path string) string {
+	var buf strings.Builder
+	for i := range len(path) {
+		c := path[i]
+		if c == '/' || isUnreserved(c) {
+			buf.WriteByte(c)
+		} else {
+			fmt.Fprintf(&buf, "%%%02X", c)
+		}
+	}
+	return buf.String()
 }
 
 // geoRegions maps cross-region inference profile prefixes to default regions.
@@ -973,6 +991,11 @@ var validRegionRE = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
 
 func validRegion(region string) bool {
 	return validRegionRE.MatchString(region)
+}
+
+func isUnreserved(c byte) bool {
+	return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+		(c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~'
 }
 
 func sha256Hex(data []byte) string {
