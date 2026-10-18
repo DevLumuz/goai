@@ -345,6 +345,13 @@ func (s *RealtimeSession) Interrupt(ctx context.Context, cursor *provider.Playba
 	return s.send(ctx, provider.RealtimeClientEvent{Type: provider.RealtimeResponseCancel, Cursor: cloned})
 }
 
+// AppendContext sends application context to a model that delegates work, such
+// as a client delegation result. Models without delegation return
+// provider.ErrRealtimeUnsupported.
+func (s *RealtimeSession) AppendContext(ctx context.Context, content provider.RealtimeContext) error {
+	return s.send(ctx, provider.RealtimeClientEvent{Type: provider.RealtimeContextAppend, Context: &content})
+}
+
 // Close terminates the session and waits for its internal goroutines. It is idempotent.
 func (s *RealtimeSession) Close() error {
 	s.closeOnce.Do(func() {
@@ -584,6 +591,10 @@ func cloneRealtimeClientEvent(event provider.RealtimeClientEvent) provider.Realt
 		cursor := *event.Cursor
 		event.Cursor = &cursor
 	}
+	if event.Context != nil {
+		content := *event.Context
+		event.Context = &content
+	}
 	if event.ToolResult != nil {
 		result := *event.ToolResult
 		result.Output = append(json.RawMessage(nil), result.Output...)
@@ -596,6 +607,10 @@ func cloneRealtimeEvent(event provider.RealtimeEvent) provider.RealtimeEvent {
 	event.Audio = append([]byte(nil), event.Audio...)
 	event.RateLimits = append([]provider.RealtimeRateLimit(nil), event.RateLimits...)
 	event.ProviderMetadata = cloneAnyMap(event.ProviderMetadata)
+	if event.Delegation != nil {
+		delegation := *event.Delegation
+		event.Delegation = &delegation
+	}
 	if event.ToolCall != nil {
 		call := *event.ToolCall
 		call.Input = append(json.RawMessage(nil), call.Input...)

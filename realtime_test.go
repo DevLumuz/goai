@@ -253,6 +253,14 @@ func TestRealtimeSessionInputMethodsAndCopies(t *testing.T) {
 		}
 	}
 
+	content := provider.RealtimeContext{Kind: provider.RealtimeContextCommentary, DelegationID: "d1", Text: "done"}
+	if err := session.AppendContext(t.Context(), content); err != nil {
+		t.Fatal(err)
+	}
+	if got := receiveRealtimeClientEvent(t, conn.sent); got.Type != provider.RealtimeContextAppend || got.Context == nil || *got.Context != content {
+		t.Fatalf("context event = %+v", got)
+	}
+
 	cursor := &provider.PlaybackCursor{ResponseID: "r", ItemID: "i", PlayedFor: 250 * time.Millisecond}
 	if err := session.Interrupt(t.Context(), cursor); err != nil {
 		t.Fatal(err)
@@ -715,20 +723,28 @@ func TestRealtimeCloneHelpers(t *testing.T) {
 		Audio:      []byte{1},
 		Metadata:   map[string]any{"list": []any{map[string]any{"k": "v"}}, "strings": []string{"a"}, "raw": json.RawMessage(`1`)},
 		Cursor:     &provider.PlaybackCursor{ItemID: "i"},
+		Context:    &provider.RealtimeContext{Text: "t"},
 		ToolResult: &provider.RealtimeToolResult{ToolCallID: "c", Output: json.RawMessage(`{}`)},
 	}
 	clone := cloneRealtimeClientEvent(event)
 	event.Audio[0] = 9
+	event.Context.Text = "changed"
 	event.Cursor.ItemID = "changed"
 	event.ToolResult.Output[0] = 'x'
 	event.Metadata["list"].([]any)[0].(map[string]any)["k"] = "changed"
 	event.Metadata["strings"].([]string)[0] = "changed"
 	event.Metadata["raw"].(json.RawMessage)[0] = '2'
-	if clone.Audio[0] != 1 || clone.Cursor.ItemID != "i" || string(clone.ToolResult.Output) != `{}` {
+	if clone.Audio[0] != 1 || clone.Cursor.ItemID != "i" || clone.Context.Text != "t" || string(clone.ToolResult.Output) != `{}` {
 		t.Fatalf("client event aliased: %+v", clone)
 	}
 	if clone.Metadata["list"].([]any)[0].(map[string]any)["k"] != "v" || clone.Metadata["strings"].([]string)[0] != "a" || string(clone.Metadata["raw"].(json.RawMessage)) != "1" {
 		t.Fatalf("metadata aliased: %+v", clone.Metadata)
+	}
+	delegation := provider.RealtimeEvent{Delegation: &provider.RealtimeDelegation{ID: "d"}}
+	cloned := cloneRealtimeEvent(delegation)
+	delegation.Delegation.ID = "changed"
+	if cloned.Delegation.ID != "d" {
+		t.Fatal("delegation aliased")
 	}
 	if cloneAnyMap(nil) != nil {
 		t.Fatal("cloneAnyMap(nil) must stay nil")

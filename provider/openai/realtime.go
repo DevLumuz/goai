@@ -21,20 +21,7 @@ import (
 //
 // Experimental: see provider.RealtimeModel.
 func Realtime(modelID string, opts ...Option) provider.RealtimeModel {
-	o := options{baseURL: defaultBaseURL}
-	for _, opt := range opts {
-		opt(&o)
-	}
-	if o.tokenSource == nil {
-		if key := os.Getenv("OPENAI_API_KEY"); key != "" {
-			o.tokenSource = provider.StaticToken(key)
-		}
-	}
-	if o.baseURL == defaultBaseURL {
-		if base := os.Getenv("OPENAI_BASE_URL"); base != "" {
-			o.baseURL = base
-		}
-	}
+	o := resolveConnectOptions(opts)
 	ts := o.tokenSource
 	return openairealtime.New(openairealtime.Config{
 		Provider:   "openai",
@@ -54,4 +41,24 @@ func Realtime(modelID string, opts ...Option) provider.RealtimeModel {
 			return nil
 		},
 	})
+}
+
+// resolveConnectOptions applies options and the OPENAI_API_KEY / OPENAI_BASE_URL
+// fallbacks shared by the WebSocket models.
+func resolveConnectOptions(opts []Option) options {
+	o := options{baseURL: defaultBaseURL}
+	for _, opt := range opts {
+		opt(&o)
+	}
+	if o.tokenSource == nil {
+		if key := os.Getenv("OPENAI_API_KEY"); key != "" {
+			o.tokenSource = provider.StaticToken(key)
+		}
+	}
+	if o.baseURL == defaultBaseURL {
+		if base := os.Getenv("OPENAI_BASE_URL"); base != "" {
+			o.baseURL = base
+		}
+	}
+	return o
 }

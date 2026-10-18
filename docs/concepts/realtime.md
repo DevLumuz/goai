@@ -15,6 +15,7 @@ A realtime session is a long-lived, bidirectional connection to a voice model. A
 | Gemini Live | `google.Live(id, google.WithVertex(project, location))` or `vertex.Live(id)` | Vertex AI |
 | OpenAI Realtime | `openai.Realtime("gpt-realtime-2.1")` | OpenAI |
 | OpenAI Realtime | `azure.Realtime(deployment)` | Azure OpenAI |
+| OpenAI GPT-Live | `openai.Live("gpt-live-1")` | OpenAI (delegates to a backend; see [Delegation](#delegation)) |
 
 Sessions connect from your Go process to the provider over WebSocket. Capturing and playing audio, and how your own clients reach your backend, are up to your application.
 
@@ -122,6 +123,37 @@ tool.ProviderDefinedOptions = google.LiveToolOptions(google.LiveBlocking, "")   
 tool.ProviderDefinedOptions = google.LiveToolOptions(google.LiveNonBlocking, google.LiveSilent) // add it quietly
 ```
 
+## Delegation
+
+Gemini Live and OpenAI Realtime are a single model that hears, reasons, calls tools, and speaks. OpenAI GPT-Live works differently: a full-duplex voice model listens and speaks at the same time and **delegates** reasoning and tool use to a backend. Models with this design report `RealtimeCapabilities.Delegation`.
+
+The delegation mode is fixed when the session starts:
+
+- **Responses delegation:** GPT-Live runs a Responses model you choose. Function tools work exactly as above: tools registered with `WithRealtimeTools` are sent to that backend, and GoAI executes the calls it makes.
+
+  ```go
+  session, err := goai.OpenRealtimeSession(ctx, openai.Live("gpt-live-1"),
+      goai.WithRealtimeTools(bookTable),
+      goai.WithRealtimeProviderOptions(openai.LiveResponsesDelegation("gpt-6-luna")),
+  )
+  ```
+
+- **Client delegation** (the default): your application runs the work with any model or agent. GPT-Live emits `RealtimeDelegationCreated` with the delegation ID (not the task text: rebuild the request from the transcripts you collected) and you answer with `AppendContext`:
+
+  ```go
+  case provider.RealtimeDelegationCreated:
+      result := runMyAgent(transcript)
+      session.AppendContext(ctx, provider.RealtimeContext{
+          Kind:         provider.RealtimeContextCommentary, // said aloud, paraphrased
+          DelegationID: ev.Delegation.ID,
+          Text:         result,
+      })
+  ```
+
+  Use `RealtimeContextThinking` for facts the model should know without saying them now, and `RealtimeContextInstructions` to steer the conversation. An empty `DelegationID` marks session-wide context, such as what the user sees on screen.
+
+Because the model is full duplex, it handles turns and interruptions itself: there is no manual turn control or explicit cancel, transcripts arrive as deltas only, and no `RealtimeResponseFinished` marks the end of a spoken reply. Usage is billed by session time and arrives as `UsageDuration`; `Close` waits for the final usage before closing the connection.
+
 ## Event Reference
 
 | Event | Meaning |
@@ -135,6 +167,7 @@ tool.ProviderDefinedOptions = google.LiveToolOptions(google.LiveNonBlocking, goo
 | `RealtimeUsageUpdated` | Token usage reported during the session. |
 | `RealtimeSessionGoAway` | The provider will close the connection after `TimeToClose`. |
 | `RealtimeSessionResumeState` | A `ResumeToken` that can resume the session on a new connection. |
+| `RealtimeDelegationCreated` | A delegating model handed work to a backend; see [Delegation](#delegation). |
 
 ## Backpressure and Lifecycle
 

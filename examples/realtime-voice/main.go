@@ -27,6 +27,11 @@
 //	GOOGLE_CLOUD_PROJECT=my-project go run ./examples/realtime-voice/main.go -backend vertex -text "Hello"
 //	OPENAI_API_KEY=... go run ./examples/realtime-voice/main.go -backend openai -model gpt-realtime-2.1 -text "Hello"
 //	AZURE_OPENAI_ENDPOINT=... AZURE_OPENAI_API_KEY=... go run ./examples/realtime-voice/main.go -backend azure -model my-deployment -text "Hello"
+//	OPENAI_API_KEY=... go run ./examples/realtime-voice/main.go -backend openai-live -model gpt-live-1 -in question24k.pcm
+//
+// GPT-Live (openai-live) is full duplex and delegates tools to a Responses
+// model (-delegate); it has no end-of-turn signal, so the example stops after a
+// few seconds without new output.
 package main
 
 import (
@@ -47,7 +52,8 @@ import (
 )
 
 func main() {
-	backend := flag.String("backend", "gemini", "gemini (AI Studio), vertex, openai, or azure")
+	backend := flag.String("backend", "gemini", "gemini (AI Studio), vertex, openai, azure, or openai-live")
+	delegate := flag.String("delegate", "gpt-6-luna", "Responses model GPT-Live delegates tools to")
 	modelID := flag.String("model", "gemini-3.8-live", "model ID, or deployment name on azure")
 	text := flag.String("text", "", "text prompt to send")
 	in := flag.String("in", "", "mono PCM16 file to send as speech (16 kHz gemini/vertex, 24 kHz openai/azure)")
@@ -58,6 +64,7 @@ func main() {
 	}
 
 	var model provider.RealtimeModel
+	var extra []goai.RealtimeOption
 	switch *backend {
 	case "gemini":
 		model = google.Live(*modelID) // reads GEMINI_API_KEY
@@ -67,20 +74,25 @@ func main() {
 		model = openai.Realtime(*modelID) // reads OPENAI_API_KEY
 	case "azure":
 		model = azure.Realtime(*modelID) // reads AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY
+	case "openai-live":
+		model = openai.Live(*modelID) // reads OPENAI_API_KEY
+		extra = append(extra, goai.WithRealtimeProviderOptions(openai.LiveResponsesDelegation(*delegate)))
 	default:
 		log.Fatalf("unknown backend %q", *backend)
 	}
-	inputRate := provider.RealtimeCapabilitiesOf(model).SupportedInputAudio[0].SampleRate
+	caps := provider.RealtimeCapabilitiesOf(model)
+	inputRate := caps.SupportedInputAudio[0].SampleRate
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	session, err := goai.OpenRealtimeSession(ctx, model,
+	opts := append([]goai.RealtimeOption{
 		goai.WithRealtimeSystem("You are a concise voice assistant."),
 		goai.WithRealtimeTools(clockTool()),
 		goai.WithRealtimeInputTranscription(provider.TranscriptionConfig{Enabled: true}),
 		goai.WithRealtimeOutputTranscription(provider.TranscriptionConfig{Enabled: true}),
-	)
+	}, extra...)
+	session, err := goai.OpenRealtimeSession(ctx, model, opts...)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -105,14 +117,31 @@ func main() {
 		}
 	}()
 
-	for ev := range session.Events() {
+	// Full-duplex models never end a turn: stop after a quiet period instead.
+	idle := time.NewTimer(time.Hour)
+	defer idle.Stop()
+	for {
+		var ev provider.RealtimeEvent
+		var ok bool
+		select {
+		case ev, ok = <-session.Events():
+		case <-idle.C:
+			fmt.Printf("reply written to %s\n", *out)
+			return
+		}
+		if !ok {
+			break
+		}
+		if caps.Delegation && (ev.Type == provider.RealtimeOutputAudio || ev.Type == provider.RealtimeOutputTranscript) {
+			idle.Reset(3 * time.Second)
+		}
 		switch ev.Type {
 		case provider.RealtimeOutputAudio:
 			if _, err := reply.Write(ev.Audio); err != nil {
 				log.Fatal(err)
 			}
 		case provider.RealtimeInputTranscript, provider.RealtimeOutputTranscript:
-			if ev.IsFinal {
+			if ev.IsFinal || caps.Delegation {
 				fmt.Printf("%s: %s\n", ev.Type, ev.Text)
 			}
 		case provider.RealtimeToolCallEvent:

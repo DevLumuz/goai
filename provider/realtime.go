@@ -162,7 +162,40 @@ const (
 	RealtimeToolResultEvent    RealtimeClientEventType = "tool_result"
 	RealtimeResponseCreate     RealtimeClientEventType = "response_create"
 	RealtimeResponseCancel     RealtimeClientEventType = "response_cancel"
+	// RealtimeContextAppend adds application context to a delegating voice model.
+	RealtimeContextAppend RealtimeClientEventType = "context_append"
 )
+
+// RealtimeContextKind selects how a delegating voice model uses appended context.
+type RealtimeContextKind string
+
+const (
+	// RealtimeContextCommentary is said aloud; the model paraphrases it.
+	RealtimeContextCommentary RealtimeContextKind = "commentary"
+	// RealtimeContextThinking informs later replies without being spoken now.
+	RealtimeContextThinking RealtimeContextKind = "thinking"
+	// RealtimeContextInstructions adds instructions to the live conversation and
+	// may interrupt speech in progress.
+	RealtimeContextInstructions RealtimeContextKind = "instructions"
+)
+
+// RealtimeContext is application content for a delegating voice model. An
+// empty DelegationID marks session-wide context instead of a task result.
+type RealtimeContext struct {
+	Kind         RealtimeContextKind
+	DelegationID string
+	Text         string
+}
+
+// RealtimeDelegation describes work a voice model hands to a backend. Target is
+// "client" when the application runs it, or the provider's backend otherwise.
+type RealtimeDelegation struct {
+	ID         string
+	Target     string
+	ResponseID string
+	// Offset is the position in the session audio where the delegation started.
+	Offset time.Duration
+}
 
 // PlaybackCursor identifies how much generated audio was actually played. It
 // allows providers that support truncation to keep conversation state aligned
@@ -188,6 +221,7 @@ type RealtimeClientEvent struct {
 	Text       string
 	ToolResult *RealtimeToolResult
 	Cursor     *PlaybackCursor
+	Context    *RealtimeContext
 	Metadata   map[string]any
 }
 
@@ -213,6 +247,7 @@ const (
 	RealtimeContextTruncated   RealtimeEventType = "context_truncated"
 	RealtimeSessionResumeState RealtimeEventType = "session_resume_state"
 	RealtimeSessionGoAway      RealtimeEventType = "session_go_away"
+	RealtimeDelegationCreated  RealtimeEventType = "delegation_created"
 	RealtimeError              RealtimeEventType = "error"
 )
 
@@ -237,19 +272,23 @@ type RealtimeRateLimit struct {
 // For transcript events, Text holds an incremental delta while IsFinal is false
 // and the complete transcript of the turn when IsFinal is true.
 type RealtimeEvent struct {
-	Type             RealtimeEventType
-	SessionID        string
-	ResponseID       string
-	ItemID           string
-	Sequence         int64
-	Audio            []byte
-	AudioFormat      AudioFormat
-	Text             string
-	IsFinal          bool
-	ToolCall         *RealtimeToolCall
-	ToolCallID       string
-	FinishReason     FinishReason
-	Usage            Usage
+	Type         RealtimeEventType
+	SessionID    string
+	ResponseID   string
+	ItemID       string
+	Sequence     int64
+	Audio        []byte
+	AudioFormat  AudioFormat
+	Text         string
+	IsFinal      bool
+	ToolCall     *RealtimeToolCall
+	ToolCallID   string
+	FinishReason FinishReason
+	Usage        Usage
+	// UsageDuration is the cumulative billed session time for providers that
+	// charge by time; each update replaces the previous one.
+	UsageDuration    time.Duration
+	Delegation       *RealtimeDelegation
 	RateLimits       []RealtimeRateLimit
 	ResumeToken      string
 	TimeToClose      time.Duration
@@ -283,8 +322,11 @@ type RealtimeCapabilities struct {
 	ContextCompression      bool
 	UsageUpdates            bool
 	RateLimitUpdates        bool
-	SupportedInputAudio     []AudioFormat
-	SupportedOutputAudio    []AudioFormat
+	// Delegation reports a voice model that hands reasoning and tools to a
+	// backend and accepts RealtimeContextAppend results.
+	Delegation           bool
+	SupportedInputAudio  []AudioFormat
+	SupportedOutputAudio []AudioFormat
 }
 
 // Clone returns capabilities whose slice fields do not alias the receiver.

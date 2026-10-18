@@ -106,11 +106,44 @@ func openAIRealtimeServer(t *testing.T, toolResult chan<- string) *httptest.Serv
 	})
 }
 
+func gptLiveServer(t *testing.T, toolResult chan<- string) *httptest.Server {
+	return websocketServer(t, func(ctx context.Context, conn *websocket.Conn) {
+		if _, ok := readUntil(ctx, conn, `"session.start"`); !ok {
+			return
+		}
+		write(ctx, conn, `{"type":"session.started","session":{"id":"s"}}`)
+		if _, ok := readUntil(ctx, conn, `"session.input_audio.append"`); !ok {
+			return
+		}
+		write(ctx, conn, `{"type":"session.delegation.created","offset_ms":0,"delegation":{"id":"d1","target":"responses","response_id":"r1"}}`)
+		write(ctx, conn, `{"type":"response.event","delegation_id":"d1","event":{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call-1","name":"lookup","arguments":"{\"q\":\"go\"}"}}}`)
+		msg, ok := readUntil(ctx, conn, `"function_call_output"`)
+		if !ok {
+			return
+		}
+		toolResult <- msg
+		if _, ok := readUntil(ctx, conn, `"response.create"`); !ok {
+			return
+		}
+		write(ctx, conn, `{"type":"session.output_audio.delta","delta":"AQID"}`)
+		write(ctx, conn, `{"type":"session.output_transcript.delta","delta":"Found it."}`)
+		if _, ok := readUntil(ctx, conn, `"session.close"`); ok {
+			write(ctx, conn, `{"type":"session.closed","usage":{"seconds":3}}`)
+		}
+		readUntil(ctx, conn, "never")
+	})
+}
+
 func TestRealtimeConformance(t *testing.T) {
 	adapters := map[string]struct {
 		server conformanceServer
 		model  func(baseURL string) provider.RealtimeModel
+		opts   []goai.RealtimeOption
 		frame  int // bytes in 100 ms of input audio
+		// turns reports whether the model signals the end of each response
+		// with RealtimeResponseFinished and a final transcript. GPT-Live is
+		// full duplex: it streams transcript deltas and never ends a turn.
+		turns bool
 	}{
 		"gemini-live": {
 			server: geminiLiveServer,
@@ -118,12 +151,22 @@ func TestRealtimeConformance(t *testing.T) {
 				return google.Live("gemini-3.8-live", google.WithAPIKey("k"), google.WithBaseURL(base))
 			},
 			frame: 3200,
+			turns: true,
 		},
 		"openai-realtime": {
 			server: openAIRealtimeServer,
 			model: func(base string) provider.RealtimeModel {
 				return openai.Realtime("gpt-realtime-2.1", openai.WithAPIKey("k"), openai.WithBaseURL(base+"/v1"))
 			},
+			frame: 4800,
+			turns: true,
+		},
+		"openai-gpt-live": {
+			server: gptLiveServer,
+			model: func(base string) provider.RealtimeModel {
+				return openai.Live("gpt-live-1", openai.WithAPIKey("k"), openai.WithBaseURL(base+"/v1"))
+			},
+			opts:  []goai.RealtimeOption{goai.WithRealtimeProviderOptions(openai.LiveResponsesDelegation("gpt-6-luna"))},
 			frame: 4800,
 		},
 	}
@@ -148,10 +191,11 @@ func TestRealtimeConformance(t *testing.T) {
 			}
 			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 			defer cancel()
-			session, err := goai.OpenRealtimeSession(ctx, adapter.model(server.URL),
+			opts := append([]goai.RealtimeOption{
 				goai.WithRealtimeTools(lookup),
 				goai.WithRealtimeOutputTranscription(provider.TranscriptionConfig{Enabled: true}),
-			)
+			}, adapter.opts...)
+			session, err := goai.OpenRealtimeSession(ctx, adapter.model(server.URL), opts...)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -185,6 +229,11 @@ func TestRealtimeConformance(t *testing.T) {
 					case provider.RealtimeOutputTranscript:
 						if ev.IsFinal {
 							transcript = ev.Text
+						} else if !adapter.turns {
+							transcript += ev.Text
+							if transcript == "Found it." {
+								break loop
+							}
 						}
 					case provider.RealtimeResponseFinished:
 						if ev.FinishReason == provider.FinishStop {

@@ -275,10 +275,10 @@ go run examples/file-search/main.go openai <vector-store-id>
 
 ### realtime-voice
 
-Bidirectional voice session. Sends a text prompt or a recorded PCM file, writes the 24 kHz spoken reply to a file, prints transcripts, and lets the model call a local tool that the session runs automatically. The same code runs on every backend (`-backend gemini|vertex|openai|azure`).
+Bidirectional voice session. Sends a text prompt or a recorded PCM file, writes the 24 kHz spoken reply to a file, prints transcripts, and lets the model call a local tool that the session runs automatically. The same code runs on every backend (`-backend gemini|vertex|openai|azure|openai-live`).
 
-- **Providers:** Gemini Live (Gemini API, Vertex AI), OpenAI Realtime (OpenAI, Azure OpenAI)
-- **Features:** `google.Live`, `vertex.Live`, `openai.Realtime`, `azure.Realtime`, `OpenRealtimeSession`, `InputAudio`, `SendText`, `WithRealtimeTools`, transcripts
+- **Providers:** Gemini Live (Gemini API, Vertex AI), OpenAI Realtime (OpenAI, Azure OpenAI), OpenAI GPT-Live
+- **Features:** `google.Live`, `vertex.Live`, `openai.Realtime`, `azure.Realtime`, `openai.Live`, `LiveResponsesDelegation`, `OpenRealtimeSession`, `InputAudio`, `SendText`, `WithRealtimeTools`, transcripts
 - **Source:** [`examples/realtime-voice/`](https://github.com/zendev-sh/goai/tree/main/examples/realtime-voice)
 
 ```bash

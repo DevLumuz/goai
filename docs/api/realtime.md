@@ -30,6 +30,7 @@ All methods are safe for concurrent use. Input buffers are copied before sending
 | `CommitInput(ctx) error` | Ends the buffered input turn in `TurnModeManual`. |
 | `RequestResponse(ctx) error` | Asks for a response explicitly. |
 | `Interrupt(ctx, cursor *provider.PlaybackCursor) error` | Cancels the active response; `cursor` reports how much audio was actually played. |
+| `AppendContext(ctx, provider.RealtimeContext) error` | Sends a delegation result or session context to a delegating model. |
 | `Close() error` | Ends the session and waits for internal goroutines. Idempotent. |
 | `Err() error` | Terminal error after `Events()` closes; nil after a normal close. |
 
@@ -93,6 +94,8 @@ type RealtimeCapableModel interface {
 | `RealtimeEvent` | Events: see the [event reference](../concepts/realtime.md#event-reference). |
 | `RealtimeToolCall` / `RealtimeToolResult` | Tool call from the model and its JSON result. |
 | `PlaybackCursor` | Response, item, and played duration for truncation on interrupt. |
+| `RealtimeDelegation` | Delegation ID, target (`client` or the provider backend), response ID, and audio offset. |
+| `RealtimeContext` | Kind (`RealtimeContextCommentary`, `RealtimeContextThinking`, `RealtimeContextInstructions`), delegation ID, and text. |
 | `RealtimeCapabilities` | What a model supports: audio formats, turn modes, tools, resumption, and more. |
 
 ### Errors

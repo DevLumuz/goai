@@ -174,6 +174,23 @@ session, err := goai.OpenRealtimeSession(ctx, model,
 - **Transcription:** input transcription defaults to `gpt-live-transcribe`; pick another model with `TranscriptionConfig.ProviderOptions["model"]`.
 - **Session fields:** other fields go in `ProviderOptions` with their Realtime API names and merge into the session, for example `{"reasoning": {"effort": "low"}}`, `{"truncation": {...}}`, or `{"audio": {"output": {"speed": 1.1}}}`.
 
+### Realtime Voice with GPT-Live
+
+`Live` opens a [realtime session](../concepts/realtime.md) with GPT-Live (`gpt-live-1`) over WebSocket (`wss://api.openai.com/v1/live/sessions`). GPT-Live is full duplex and delegates reasoning and tools to a backend; see [Delegation](../concepts/realtime.md#delegation). Experimental.
+
+```go
+session, err := goai.OpenRealtimeSession(ctx, openai.Live("gpt-live-1"),
+    goai.WithRealtimeVoice("marin"),
+    goai.WithRealtimeTools(weatherTool), // run by the Responses backend
+    goai.WithRealtimeProviderOptions(openai.LiveResponsesDelegation("gpt-6-luna")),
+)
+```
+
+- **Audio:** one format for both directions, fixed at start: 24 kHz (default) or 16 kHz mono PCM16, or 8 kHz G.711.
+- **Delegation:** `LiveResponsesDelegation(model)` or `LiveClientDelegation()` (default). Add backend settings such as `instructions`, `reasoning`, `service_tier`, or hosted tools under `delegation.responses` in the returned map. With Responses delegation, typed input (`SendText`) goes to the backend as a user message and `RequestResponse` continues it.
+- **Not available:** manual turns, client activity signals, and explicit cancel or truncation (the model manages interruptions); transcripts are deltas without a final event. The Decisions delegation mode, session forks, and sideband connections are not wrapped yet.
+- **Usage:** `RealtimeUsageUpdated` carries the cumulative session time in `UsageDuration`. `Close` sends `session.close` and waits up to 15 seconds for the final usage.
+
 ## API Routing
 
 All models use the Responses API (`/v1/responses`) by default. To force Chat Completions:

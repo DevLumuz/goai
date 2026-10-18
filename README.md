@@ -55,7 +55,7 @@ Inspired by the [Vercel AI SDK](https://sdk.vercel.ai). The same clean abstracti
 - **Computer use**: Anthropic computer, bash, text editor tools for autonomous desktop interaction
 - **26 provider-defined tools**: Web fetch, file search, image generation, X search, and more - [full list](#provider-defined-tools)
 - **MCP client**: Connect to any MCP server (stdio, HTTP, SSE), auto-convert tools for use with GoAI
-- **Realtime voice** (experimental): Bidirectional audio sessions with interruption and automatic tool calls via Gemini Live (Gemini API, Vertex AI) and OpenAI Realtime (OpenAI, Azure OpenAI)
+- **Realtime voice** (experimental): Bidirectional audio sessions with interruption and automatic tool calls via Gemini Live (Gemini API, Vertex AI) OpenAI Realtime (OpenAI, Azure OpenAI), and OpenAI GPT-Live with backend delegation
 - **Observability**: Built-in Langfuse and OpenTelemetry (OTel) integrations for tracing generations, tools, and multi-step loops
 - **Multi-agent orchestration**: For declarative YAML workflows on top of GoAI, see [zenflow](https://github.com/zendev-sh/zenflow)
 - **10 lifecycle hooks**: Observability (`OnRequest`, `OnResponse`, `OnToolCallStart`, `OnToolCall`, `OnStepFinish`, `OnFinish`, `OnPanic`) and interceptor (`OnBeforeToolExecute`, `OnAfterToolExecute`, `OnBeforeStep`) hooks for permission gates, secret scanning, output transformation, and loop control
@@ -369,7 +369,7 @@ Image-to-video is supported with `WithVideoImage`. First/last frames and image r
 Open a bidirectional voice session: stream audio in, play audio out, and let the model call tools mid-conversation. Experimental.
 
 ```go
-model := google.Live("gemini-3.8-live") // or vertex.Live, openai.Realtime, azure.Realtime
+model := google.Live("gemini-3.8-live") // or vertex.Live, openai.Realtime, azure.Realtime, openai.Live
 session, err := goai.OpenRealtimeSession(ctx, model, goai.WithRealtimeTools(weatherTool))
 if err != nil {
 	panic(err)
