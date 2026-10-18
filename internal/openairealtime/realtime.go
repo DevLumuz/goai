@@ -500,19 +500,28 @@ func (c *conn) Send(ctx context.Context, event provider.RealtimeClientEvent) err
 	if err != nil {
 		return err
 	}
+	// Content goes out before any response request is registered: otherwise the
+	// reader could send a coalesced response.create ahead of it on response.done.
+	for _, msg := range msgs {
+		if err := c.writeEvent(ctx, msg); err != nil {
+			return err
+		}
+	}
 	if event.Type == provider.RealtimeToolResultEvent {
 		respond = c.toolOutputSent(event.ToolResult.ToolCallID)
 	}
 	if respond && c.requestResponse() {
-		msgs = append(msgs, clientEvent{"type": "response.create"})
+		return c.writeEvent(ctx, clientEvent{"type": "response.create"})
 	}
-	for _, msg := range msgs {
-		if err := c.write(ctx, msg); err != nil {
-			if c.ctx.Err() != nil {
-				return provider.ErrRealtimeSessionClosed
-			}
-			return fmt.Errorf("%s: sending realtime event: %w", c.provider, err)
+	return nil
+}
+
+func (c *conn) writeEvent(ctx context.Context, msg clientEvent) error {
+	if err := c.write(ctx, msg); err != nil {
+		if c.ctx.Err() != nil {
+			return provider.ErrRealtimeSessionClosed
 		}
+		return fmt.Errorf("%s: sending realtime event: %w", c.provider, err)
 	}
 	return nil
 }
