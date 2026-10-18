@@ -115,6 +115,7 @@ session, err := goai.OpenRealtimeSession(ctx, model,
 - When the provider cancels a call (for example after an interruption), the tool's context is cancelled and its result is dropped.
 - Results are sent as JSON. Text that is not JSON is wrapped as `{"text": "..."}`; errors as `{"error": "..."}`. Keep secrets and internal details out of both.
 - The model decides which tool to call. Authorization and human confirmation belong in `WithRealtimeOnBeforeToolExecute`.
+- A tool registered without `Execute` is declared to the model but not run: its `RealtimeToolCallEvent` reaches your application, which answers with `SendToolResult`. Use it when the work happens elsewhere, such as on a user's device. Where `RealtimeCapabilities.PartialToolResults` is set, `Partial: true` sends an intermediate result and more follow.
 
 With OpenAI Realtime the model waits for the tool outputs of a response; GoAI continues the conversation once all of them are sent. Gemini 3.8 Live runs functions without blocking the conversation by default. Choose per tool with `google.LiveToolOptions`:
 
@@ -122,6 +123,32 @@ With OpenAI Realtime the model waits for the tool outputs of a response; GoAI co
 tool.ProviderDefinedOptions = google.LiveToolOptions(google.LiveBlocking, "")       // wait for the result
 tool.ProviderDefinedOptions = google.LiveToolOptions(google.LiveNonBlocking, google.LiveSilent) // add it quietly
 ```
+
+## Images and Video
+
+Models that see report `RealtimeCapabilities.ImageInput`. GoAI provides the channel, not the camera: capture and encode frames in your application, then send each one with `InputImage`:
+
+```go
+session.InputImage(ctx, provider.RealtimeMedia{MIMEType: "image/jpeg", Data: jpegFrame})
+```
+
+Video is a stream of such frames; send them at the rate the provider documents (about one per second for Gemini Live). Models that generate images or video, such as an avatar, report `OutputMedia` and emit `RealtimeOutputMedia` events with the encoded bytes in `ev.Media`.
+
+## Updating a Live Session
+
+- `AppendConversation` adds messages to the history, for example to restore an earlier conversation; `RequestResponse` asks the model to answer once they are in.
+- `UpdateSession` changes instructions, tools, or provider settings without reconnecting (`RuntimeSessionUpdate`). A nil field keeps its value; a non-nil empty `Tools` removes every tool. The session dispatches the new tools from then on.
+- `EndInputAudio` tells the provider the microphone paused, so it can flush buffered audio (`InputAudioEnd`).
+
+## Raw Provider Events
+
+Every feature of a provider is reachable, even before GoAI types it:
+
+- A provider message, or part of one, without a mapping arrives as `RealtimeProviderEvent` with its JSON in `ev.Raw`. Nothing is dropped silently.
+- `WithRealtimeRawEvents(true)` delivers every provider message that way, each one just before the events normalized from it.
+- `SendRaw` writes provider JSON as given. It bypasses the adapter's state tracking, such as the response sequencing of OpenAI Realtime, so you own its consequences.
+
+Models with this channel report `RealtimeCapabilities.RawEvents`.
 
 ## Delegation
 
@@ -158,16 +185,24 @@ Because the model is full duplex, it handles turns and interruptions itself: the
 
 | Event | Meaning |
 | --- | --- |
-| `RealtimeSessionReady` | Setup confirmed; the session accepts input. |
+| `RealtimeSessionReady` | Setup confirmed; the session accepts input. `SessionID` identifies it when the provider reports one. |
 | `RealtimeInputSpeechStarted` / `Stopped` | Voice activity detected by the provider. |
 | `RealtimeInputTranscript` / `RealtimeOutputTranscript` | Transcripts. `IsFinal == false` carries a delta; `IsFinal == true` carries the full turn. |
 | `RealtimeResponseStarted` / `RealtimeResponseFinished` | A model response begins / ends, with its `FinishReason`. |
-| `RealtimeOutputAudio` / `RealtimeTextDelta` | Model output. |
+| `RealtimeOutputAudio` / `RealtimeTextDelta` / `RealtimeOutputMedia` | Model output: audio, text, and generated images or video. |
+| `RealtimeReasoningDelta` | Model reasoning text, not spoken. |
+| `RealtimeGenerationComplete` | The model finished generating; buffered audio may still be playing. |
+| `RealtimeWaitingForInput` | The model is waiting for the user. |
+| `RealtimeSources` | Sources a response was grounded on, in `ev.Sources`. |
 | `RealtimeToolCallEvent` / `RealtimeToolCallCancelled` | Tool calls and cancellations. |
 | `RealtimeUsageUpdated` | Token usage reported during the session. |
 | `RealtimeSessionGoAway` | The provider will close the connection after `TimeToClose`. |
 | `RealtimeSessionResumeState` | A `ResumeToken` that can resume the session on a new connection. |
 | `RealtimeDelegationCreated` | A delegating model handed work to a backend; see [Delegation](#delegation). |
+| `RealtimeError` | A non-terminal provider error; terminal ones end the session and surface in `Err()`. |
+| `RealtimeProviderEvent` | A provider message as raw JSON; see [Raw Provider Events](#raw-provider-events). |
+
+Transcript and speech events may also carry `IsInterim` (a revisable hypothesis), `AudioStart` / `AudioEnd` (position in the input audio), `Language`, and `Speaker`. A finished response with `Pending == true` belongs to an interaction that continues, such as a function still running.
 
 ## Backpressure and Lifecycle
 

@@ -31,6 +31,12 @@ All methods are safe for concurrent use. Input buffers are copied before sending
 | `RequestResponse(ctx) error` | Asks for a response explicitly. |
 | `Interrupt(ctx, cursor *provider.PlaybackCursor) error` | Cancels the active response; `cursor` reports how much audio was actually played. |
 | `AppendContext(ctx, provider.RealtimeContext) error` | Sends a delegation result or session context to a delegating model. |
+| `InputImage(ctx, provider.RealtimeMedia) error` | Sends an encoded image or video frame. |
+| `EndInputAudio(ctx) error` | Reports that the input audio stream paused or ended. |
+| `AppendConversation(ctx, provider.RealtimeConversation) error` | Adds messages to the conversation history. |
+| `UpdateSession(ctx, RealtimeUpdate) error` | Changes instructions, tools, or provider settings of the live session. |
+| `SendToolResult(ctx, provider.RealtimeToolResult) error` | Answers a call to a tool registered without `Execute`. |
+| `SendRaw(ctx, json.RawMessage) error` | Writes provider JSON as given, bypassing adapter state tracking. |
 | `Close() error` | Ends the session and waits for internal goroutines. Idempotent. |
 | `Err() error` | Terminal error after `Events()` closes; nil after a normal close. |
 
@@ -41,7 +47,7 @@ After `Close` or a terminal error, sending returns `provider.ErrRealtimeSessionC
 | Option | Description |
 | --- | --- |
 | `WithRealtimeSystem(string)` | System instructions. |
-| `WithRealtimeTools(...Tool)` | Tools offered to the model; those with `Execute` run automatically. |
+| `WithRealtimeTools(...Tool)` | Tools offered to the model; those with `Execute` run automatically, the rest are answered with `SendToolResult`. Names must be unique. |
 | `WithRealtimeToolChoice(string)` | Tool choice, where the provider supports it. |
 | `WithRealtimeAudio(input, output provider.AudioFormat)` | Audio formats; zero values use the model defaults. |
 | `WithRealtimeVoice(string)` | Provider voice name. |
@@ -50,6 +56,7 @@ After `Close` or a terminal error, sending returns `provider.ErrRealtimeSessionC
 | `WithRealtimeOutputTranscription(provider.TranscriptionConfig)` | Transcribe model audio. |
 | `WithRealtimeMaxOutputTokens(int)` | Response token limit. |
 | `WithRealtimeProviderOptions(map[string]any)` | Provider-specific session fields. |
+| `WithRealtimeRawEvents(bool)` | Also deliver every provider message as a `RealtimeProviderEvent`. |
 | `WithRealtimeEventBuffer(int)` | Size of the event queue (default 64). |
 | `WithRealtimeBackpressureTimeout(time.Duration)` | How long a full queue may wait before failing (default 1s). |
 | `WithRealtimeToolTimeout(time.Duration)` | Per-tool timeout (default 30s; ≤ 0 disables). |
@@ -90,13 +97,16 @@ type RealtimeCapableModel interface {
 | `RealtimeParams` | Initial session configuration built from the options above. |
 | `TurnDetection` | `Mode`, `DisableAutoResponse`, `DisableInterruption`, provider options. |
 | `TranscriptionConfig` | `Enabled`, `Language`, `Prompt`, provider options. |
-| `RealtimeClientEvent` | Commands: audio, activity, text, tool result, response create/cancel. |
+| `RealtimeClientEvent` | Commands: audio, activity, text, image, tool result, response create/cancel, context, conversation, session update, raw. |
+| `RealtimeMedia` | MIME type and encoded bytes of an image or video frame. |
+| `RealtimeConversation` | Messages to add to the history, and whether to respond after them. |
+| `RealtimeSessionUpdate` / `goai.RealtimeUpdate` | Live session changes; nil fields keep their value, an empty non-nil `Tools` removes all tools. |
 | `RealtimeEvent` | Events: see the [event reference](../concepts/realtime.md#event-reference). |
-| `RealtimeToolCall` / `RealtimeToolResult` | Tool call from the model and its JSON result. |
+| `RealtimeToolCall` / `RealtimeToolResult` | Tool call from the model and its JSON result, with optional `Partial`, `Media`, and provider options. |
 | `PlaybackCursor` | Response, item, and played duration for truncation on interrupt. |
 | `RealtimeDelegation` | Delegation ID, target (`client` or the provider backend), response ID, and audio offset. |
 | `RealtimeContext` | Kind (`RealtimeContextCommentary`, `RealtimeContextThinking`, `RealtimeContextInstructions`), delegation ID, and text. |
-| `RealtimeCapabilities` | What a model supports: audio formats, turn modes, tools, resumption, and more. |
+| `RealtimeCapabilities` | What a model supports: audio formats, turn modes, tools, images, raw events, and more. |
 
 ### Errors
 

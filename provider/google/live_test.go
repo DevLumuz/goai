@@ -322,8 +322,10 @@ func TestLive_ServerEvents(t *testing.T) {
 		provider.RealtimeInputTranscript,
 		provider.RealtimeInputSpeechStopped,
 		provider.RealtimeResponseStarted,
+		provider.RealtimeReasoningDelta,
 		provider.RealtimeOutputAudio,
 		provider.RealtimeOutputTranscript,
+		provider.RealtimeGenerationComplete,
 		provider.RealtimeInputTranscript,  // final
 		provider.RealtimeOutputTranscript, // final
 		provider.RealtimeResponseFinished,
@@ -345,32 +347,35 @@ func TestLive_ServerEvents(t *testing.T) {
 			t.Fatalf("sequence not increasing at %d: %d after %d", i, ev.Sequence, events[i-1].Sequence)
 		}
 	}
-	if ev := events[6]; string(ev.Audio) != "\x01\x02\x03" || ev.AudioFormat != liveOutputFormat {
+	if ev := events[6]; ev.Text != "plan" {
+		t.Fatalf("reasoning event = %+v", ev)
+	}
+	if ev := events[7]; string(ev.Audio) != "\x01\x02\x03" || ev.AudioFormat != liveOutputFormat {
 		t.Fatalf("audio event = %+v", ev)
 	}
-	if ev := events[8]; !ev.IsFinal || ev.Text != "hola mundo" {
+	if ev := events[10]; !ev.IsFinal || ev.Text != "hola mundo" {
 		t.Fatalf("final input transcript = %+v", ev)
 	}
-	if ev := events[9]; !ev.IsFinal || ev.Text != "Hi" {
+	if ev := events[11]; !ev.IsFinal || ev.Text != "Hi" {
 		t.Fatalf("final output transcript = %+v", ev)
 	}
-	if ev := events[10]; ev.FinishReason != provider.FinishStop {
+	if ev := events[12]; ev.FinishReason != provider.FinishStop {
 		t.Fatalf("finish reason = %s", ev.FinishReason)
 	}
-	if ev := events[11]; ev.TimeToClose != 5500*time.Millisecond {
+	if ev := events[13]; ev.TimeToClose != 5500*time.Millisecond {
 		t.Fatalf("time to close = %s", ev.TimeToClose)
 	}
-	if ev := events[12]; ev.ResumeToken != "h1" {
+	if ev := events[14]; ev.ResumeToken != "h1" {
 		t.Fatalf("resume token = %q", ev.ResumeToken)
 	}
 	wantUsage := provider.Usage{InputTokens: 60, CacheReadTokens: 40, OutputTokens: 20, ReasoningTokens: 5, TotalTokens: 125}
-	if ev := events[13]; ev.Usage != wantUsage {
+	if ev := events[15]; ev.Usage != wantUsage {
 		t.Fatalf("usage = %+v, want %+v", ev.Usage, wantUsage)
 	}
-	if ev := events[14]; ev.Usage.OutputTokens != 7 || ev.Usage.InputTokens != 10 {
+	if ev := events[16]; ev.Usage.OutputTokens != 7 || ev.Usage.InputTokens != 10 {
 		t.Fatalf("vertex usage = %+v", ev.Usage)
 	}
-	if ev := events[15]; ev.Error == nil || !strings.Contains(ev.Error.Error(), "RESOURCE_EXHAUSTED") {
+	if ev := events[17]; ev.Error == nil || !strings.Contains(ev.Error.Error(), "RESOURCE_EXHAUSTED") {
 		t.Fatalf("error event = %+v", ev)
 	}
 }
@@ -707,7 +712,7 @@ func TestLiveRealtimeCapabilities(t *testing.T) {
 		t.Fatalf("ModelID = %q", model.ModelID())
 	}
 	caps := provider.RealtimeCapabilitiesOf(model)
-	if !caps.FunctionCalling || !caps.NonBlockingToolCalls || caps.ExplicitResponseRequest || caps.OutputAudioTruncation {
+	if !caps.FunctionCalling || !caps.NonBlockingToolCalls || !caps.RawEvents || caps.ExplicitResponseRequest || caps.OutputAudioTruncation {
 		t.Fatalf("unexpected capabilities: %+v", caps)
 	}
 	if len(caps.SupportedInputAudio) != 1 || caps.SupportedInputAudio[0] != liveInputFormat {
@@ -742,7 +747,124 @@ func FuzzLiveTranslate(f *testing.F) {
 			return
 		}
 		c := &liveConn{calls: map[string]string{}}
-		_ = c.translate(msg)
+		_ = c.translateMessage(data, msg)
 		_ = c.finishTurn()
 	})
+}
+
+func TestLive_RawEventsAndUnmappedContent(t *testing.T) {
+	ignore := goleak.IgnoreCurrent()
+	t.Cleanup(func() { goleak.VerifyNone(t, ignore) })
+
+	unknownTop := `{"futureMessage":{"x":1}}`
+	unknownContent := `{"serverContent":{"futureField":true,"turnComplete":true}}`
+	unknownPart := `{"serverContent":{"modelTurn":{"parts":[{"executableCode":{"code":"1+1"}}]}}}`
+	unknownActivity := `{"voiceActivity":{"type":"FUTURE"}}`
+	rawSent := make(chan map[string]json.RawMessage, 1)
+	server := liveTestServer(t, func(ctx context.Context, conn *websocket.Conn, _ *http.Request) {
+		acceptSetup(t, ctx, conn)
+		for _, msg := range []string{unknownTop, unknownPart, unknownContent, unknownActivity, `{"goAway":{"timeLeft":"1s"}}`} {
+			sendServerMessage(t, ctx, conn, msg)
+		}
+		rawSent <- readClientMessage(t, ctx, conn)
+		drainUntilClose(ctx, conn)
+	})
+
+	conn, err := Live("m", WithAPIKey("k"), WithBaseURL(server.URL)).OpenRealtime(t.Context(), provider.RealtimeParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	want := []struct {
+		typ provider.RealtimeEventType
+		raw string
+	}{
+		{provider.RealtimeSessionReady, ""},
+		{provider.RealtimeProviderEvent, unknownTop},
+		{provider.RealtimeProviderEvent, unknownPart},
+		{provider.RealtimeResponseStarted, ""},
+		{provider.RealtimeProviderEvent, unknownContent},
+		{provider.RealtimeResponseFinished, ""},
+		{provider.RealtimeProviderEvent, unknownActivity},
+		{provider.RealtimeSessionGoAway, ""}, // fully mapped: no raw copy
+	}
+	for i, w := range want {
+		ev := nextEvent(t, conn)
+		if ev.Type != w.typ || string(ev.Raw) != w.raw {
+			t.Fatalf("event %d = %s %s, want %s %s", i, ev.Type, ev.Raw, w.typ, w.raw)
+		}
+	}
+
+	if err := conn.Send(t.Context(), provider.RealtimeClientEvent{Type: provider.RealtimeRawEvent, Raw: json.RawMessage(`{"futureInput":{"a":1}}`)}); err != nil {
+		t.Fatal(err)
+	}
+	if got := <-rawSent; string(got["futureInput"]) != `{"a":1}` {
+		t.Fatalf("raw message = %v", got)
+	}
+	for _, raw := range []string{`[]`, `{"broken"`, ``} {
+		err := conn.Send(t.Context(), provider.RealtimeClientEvent{Type: provider.RealtimeRawEvent, Raw: json.RawMessage(raw)})
+		if !errors.Is(err, provider.ErrInvalidRealtimeConfig) {
+			t.Fatalf("raw %q error = %v", raw, err)
+		}
+	}
+}
+
+func TestLive_IncludeRawEvents(t *testing.T) {
+	ignore := goleak.IgnoreCurrent()
+	t.Cleanup(func() { goleak.VerifyNone(t, ignore) })
+
+	goAway := `{"goAway":{"timeLeft":"1s"}}`
+	server := liveTestServer(t, func(ctx context.Context, conn *websocket.Conn, _ *http.Request) {
+		acceptSetup(t, ctx, conn)
+		sendServerMessage(t, ctx, conn, goAway)
+		drainUntilClose(ctx, conn)
+	})
+
+	conn, err := Live("m", WithAPIKey("k"), WithBaseURL(server.URL)).OpenRealtime(t.Context(), provider.RealtimeParams{IncludeRawEvents: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	want := []struct {
+		typ provider.RealtimeEventType
+		raw string
+	}{
+		{provider.RealtimeProviderEvent, `{"setupComplete":{}}`},
+		{provider.RealtimeSessionReady, ""},
+		{provider.RealtimeProviderEvent, goAway},
+		{provider.RealtimeSessionGoAway, ""},
+	}
+	for i, w := range want {
+		ev := nextEvent(t, conn)
+		if ev.Type != w.typ || string(ev.Raw) != w.raw || ev.Sequence != int64(i+1) {
+			t.Fatalf("event %d = %s %s seq %d, want %s %s", i, ev.Type, ev.Raw, ev.Sequence, w.typ, w.raw)
+		}
+	}
+}
+
+func TestLive_MessagesBeforeSetupCompleteAreDelivered(t *testing.T) {
+	ignore := goleak.IgnoreCurrent()
+	t.Cleanup(func() { goleak.VerifyNone(t, ignore) })
+
+	early := `{"futureNotice":{}}`
+	server := liveTestServer(t, func(ctx context.Context, conn *websocket.Conn, _ *http.Request) {
+		_ = readClientMessage(t, ctx, conn)
+		sendServerMessage(t, ctx, conn, early)
+		sendServerMessage(t, ctx, conn, `{"setupComplete":{}}`)
+		drainUntilClose(ctx, conn)
+	})
+
+	conn, err := Live("m", WithAPIKey("k"), WithBaseURL(server.URL)).OpenRealtime(t.Context(), provider.RealtimeParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	if ev := nextEvent(t, conn); ev.Type != provider.RealtimeProviderEvent || string(ev.Raw) != early {
+		t.Fatalf("early message = %+v", ev)
+	}
+	if ev := nextEvent(t, conn); ev.Type != provider.RealtimeSessionReady {
+		t.Fatalf("second event = %s", ev.Type)
+	}
 }

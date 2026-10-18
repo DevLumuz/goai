@@ -203,6 +203,7 @@ func TestLive_ClientDelegation(t *testing.T) {
 		provider.RealtimeOutputAudio,
 		provider.RealtimeOutputTranscript,
 		provider.RealtimeUsageUpdated,
+		provider.RealtimeProviderEvent, // the commentary acknowledgement has no mapping
 		provider.RealtimeError,
 	}
 	events := make([]provider.RealtimeEvent, len(want))
@@ -221,7 +222,10 @@ func TestLive_ClientDelegation(t *testing.T) {
 	if ev := events[5]; ev.UsageDuration != 4500*time.Millisecond {
 		t.Errorf("usage duration = %s", ev.UsageDuration)
 	}
-	if err := events[6].Error; err == nil || !strings.Contains(err.Error(), "unknown_delegation") {
+	if raw := string(events[6].Raw); !strings.Contains(raw, "session.commentary.appended") {
+		t.Errorf("raw event = %s", raw)
+	}
+	if err := events[7].Error; err == nil || !strings.Contains(err.Error(), "unknown_delegation") {
 		t.Errorf("error event = %v", err)
 	}
 
@@ -291,7 +295,7 @@ func TestLive_ClientDelegation(t *testing.T) {
 func TestLive_TranscriptsOnlyWhenEnabled(t *testing.T) {
 	c := &liveConn{pending: map[string]bool{}}
 	for _, typ := range []string{"session.input_transcript.delta", "session.output_transcript.delta"} {
-		if evs := c.translate(liveServerEvent{Type: typ, Delta: "x"}); len(evs) != 0 {
+		if evs, known := c.translate(liveServerEvent{Type: typ, Delta: "x"}); len(evs) != 0 || !known {
 			t.Errorf("%s emitted without transcription enabled: %+v", typ, evs)
 		}
 	}
@@ -387,23 +391,23 @@ func TestLive_BackendErrors(t *testing.T) {
 		`{"type":"error","code":"tool_outputs_required","message":"missing outputs"}`,
 		`{"type":"error","error":{"code":"x","message":"nested"}}`,
 	} {
-		evs := c.translateBackend(json.RawMessage(raw))
-		if len(evs) != 1 || evs[0].Type != provider.RealtimeError {
+		evs, known := c.translateBackend(json.RawMessage(raw))
+		if len(evs) != 1 || evs[0].Type != provider.RealtimeError || !known {
 			t.Errorf("translateBackend(%s) = %+v", raw, evs)
 		}
 	}
 	for _, raw := range []string{``, `{bad`, `{"type":"response.output_text.delta","delta":"x"}`, `{"type":"response.output_item.done"}`} {
-		if evs := c.translateBackend(json.RawMessage(raw)); len(evs) != 0 {
-			t.Errorf("translateBackend(%q) = %+v", raw, evs)
+		if evs, known := c.translateBackend(json.RawMessage(raw)); len(evs) != 0 || known {
+			t.Errorf("unmapped backend event %q = %+v, %v", raw, evs, known)
 		}
 	}
-	if evs := c.translate(liveServerEvent{Type: "session.output_audio.delta", Delta: "!!"}); len(evs) != 1 || evs[0].Type != provider.RealtimeError {
+	if evs, _ := c.translate(liveServerEvent{Type: "session.output_audio.delta", Delta: "!!"}); len(evs) != 1 || evs[0].Type != provider.RealtimeError {
 		t.Errorf("bad audio = %+v", evs)
 	}
-	if evs := c.translate(liveServerEvent{Type: "session.delegation.created"}); len(evs) != 0 {
+	if evs, known := c.translate(liveServerEvent{Type: "session.delegation.created"}); len(evs) != 0 || known {
 		t.Errorf("delegation without payload = %+v", evs)
 	}
-	if evs := c.translate(liveServerEvent{Type: "session.usage.updated"}); len(evs) != 0 {
+	if evs, _ := c.translate(liveServerEvent{Type: "session.usage.updated"}); len(evs) != 0 {
 		t.Errorf("usage without payload = %+v", evs)
 	}
 	if c.outputSent("unknown") {
@@ -573,7 +577,7 @@ func TestLive_Capabilities(t *testing.T) {
 		t.Fatalf("ModelID = %q", model.ModelID())
 	}
 	caps := provider.RealtimeCapabilitiesOf(model)
-	if !caps.Delegation || !caps.BargeIn || caps.ManualTurnControl || caps.OutputAudioTruncation || len(caps.SupportedInputAudio) != 4 {
+	if !caps.Delegation || !caps.BargeIn || !caps.RawEvents || caps.ManualTurnControl || caps.OutputAudioTruncation || len(caps.SupportedInputAudio) != 4 {
 		t.Fatalf("capabilities = %+v", caps)
 	}
 	if got, _ := liveURL("https://api.openai.com/v1/"); got != "wss://api.openai.com/v1/live/sessions" {
@@ -598,6 +602,85 @@ func FuzzLiveTranslate(f *testing.F) {
 			return
 		}
 		c := &liveConn{pending: map[string]bool{}, inputTr: true, outputTr: true}
-		_ = c.translate(ev)
+		_ = c.translateMessage(ev, data)
 	})
+}
+
+func TestLive_RawEvents(t *testing.T) {
+	liveNoLeaks(t)
+
+	early := `{"type":"session.notice","message":"hi"}`
+	backend := `{"type":"response.event","event":{"type":"response.output_text.delta","delta":"x"}}`
+	received := make(chan string, 4)
+	server := liveServer(t, func(ctx context.Context, conn *websocket.Conn, _ *http.Request) {
+		if ev, _, ok := liveRead(ctx, conn); !ok || ev["type"] != "session.start" {
+			return
+		}
+		liveWrite(ctx, conn, early)
+		liveWrite(ctx, conn, `{"type":"session.started","session":{"id":"sess_live"}}`)
+		liveWrite(ctx, conn, backend)
+		liveRelay(ctx, conn, received, `{"seconds":1}`)
+	})
+
+	conn, err := Live("gpt-live-1", WithAPIKey("k"), WithBaseURL(server.URL+"/v1")).OpenRealtime(t.Context(), provider.RealtimeParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, want := range []struct {
+		typ provider.RealtimeEventType
+		raw string
+	}{
+		{provider.RealtimeProviderEvent, early},
+		{provider.RealtimeSessionReady, ""},
+		{provider.RealtimeProviderEvent, backend},
+	} {
+		if ev := liveNext(t, conn); ev.Type != want.typ || string(ev.Raw) != want.raw {
+			t.Fatalf("event %d = %s %s, want %s %s", i, ev.Type, ev.Raw, want.typ, want.raw)
+		}
+	}
+
+	if err := conn.Send(t.Context(), provider.RealtimeClientEvent{Type: provider.RealtimeRawEvent, Raw: json.RawMessage(`{"type":"session.input_audio.clear"}`)}); err != nil {
+		t.Fatal(err)
+	}
+	if got := <-received; got != `{"type":"session.input_audio.clear"}` {
+		t.Fatalf("raw event = %s", got)
+	}
+	if err := conn.Send(t.Context(), provider.RealtimeClientEvent{Type: provider.RealtimeRawEvent, Raw: json.RawMessage(`"x"`)}); !errors.Is(err, provider.ErrInvalidRealtimeConfig) {
+		t.Fatalf("invalid raw error = %v", err)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLive_IncludeRawEvents(t *testing.T) {
+	liveNoLeaks(t)
+
+	usage := `{"type":"session.usage.updated","usage":{"seconds":2}}`
+	server := liveServer(t, func(ctx context.Context, conn *websocket.Conn, _ *http.Request) {
+		liveAccept(ctx, conn)
+		liveWrite(ctx, conn, usage)
+		liveRelay(ctx, conn, make(chan string, 4), `{"seconds":2}`)
+	})
+
+	conn, err := Live("gpt-live-1", WithAPIKey("k"), WithBaseURL(server.URL+"/v1")).OpenRealtime(t.Context(), provider.RealtimeParams{IncludeRawEvents: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, want := range []struct {
+		typ provider.RealtimeEventType
+		raw string
+	}{
+		{provider.RealtimeProviderEvent, `{"type":"session.started","session":{"id":"sess_live"}}`},
+		{provider.RealtimeSessionReady, ""},
+		{provider.RealtimeProviderEvent, usage},
+		{provider.RealtimeUsageUpdated, ""},
+	} {
+		if ev := liveNext(t, conn); ev.Type != want.typ || string(ev.Raw) != want.raw || ev.Sequence != int64(i+1) {
+			t.Fatalf("event %d = %s %s seq %d, want %s %s", i, ev.Type, ev.Raw, ev.Sequence, want.typ, want.raw)
+		}
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
 }

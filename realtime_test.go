@@ -750,3 +750,287 @@ func TestRealtimeCloneHelpers(t *testing.T) {
 		t.Fatal("cloneAnyMap(nil) must stay nil")
 	}
 }
+
+func TestRealtimeSessionParityMethodsSendCopies(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	conn := newFakeRealtimeConnection(1, 16)
+	captured := make(chan provider.RealtimeParams, 1)
+	model := &fakeRealtimeModel{id: "test", openFn: func(_ context.Context, params provider.RealtimeParams) (provider.RealtimeConnection, error) {
+		captured <- params
+		return conn, nil
+	}}
+	session, err := OpenRealtimeSession(t.Context(), model, WithRealtimeRawEvents(true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if params := <-captured; !params.IncludeRawEvents {
+		t.Fatal("WithRealtimeRawEvents not applied")
+	}
+
+	frame := []byte{0xff, 0xd8}
+	if err := session.InputImage(t.Context(), provider.RealtimeMedia{MIMEType: "image/jpeg", Data: frame}); err != nil {
+		t.Fatal(err)
+	}
+	frame[0] = 0
+	if got := receiveRealtimeClientEvent(t, conn.sent); got.Type != provider.RealtimeImageInput || got.Media == nil ||
+		got.Media.MIMEType != "image/jpeg" || got.Media.Data[0] != 0xff {
+		t.Fatalf("image event = %+v", got)
+	}
+
+	if err := session.EndInputAudio(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if got := receiveRealtimeClientEvent(t, conn.sent); got.Type != provider.RealtimeInputAudioEnd {
+		t.Fatalf("audio end event = %+v", got)
+	}
+
+	messages := []provider.Message{{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "hi"}}}}
+	if err := session.AppendConversation(t.Context(), provider.RealtimeConversation{Messages: messages, RequestResponse: true}); err != nil {
+		t.Fatal(err)
+	}
+	messages[0].Content[0].Text = "changed"
+	if got := receiveRealtimeClientEvent(t, conn.sent); got.Type != provider.RealtimeConversationAppend || got.Conversation == nil ||
+		!got.Conversation.RequestResponse || got.Conversation.Messages[0].Content[0].Text != "hi" {
+		t.Fatalf("conversation event = %+v", got)
+	}
+
+	output := json.RawMessage(`{"ok":true}`)
+	result := provider.RealtimeToolResult{ToolCallID: "c1", Output: output, Partial: true,
+		Media: []provider.RealtimeMedia{{MIMEType: "image/png", Data: []byte{1}}}}
+	if err := session.SendToolResult(t.Context(), result); err != nil {
+		t.Fatal(err)
+	}
+	output[0] = 'x'
+	result.Media[0].Data[0] = 9
+	got := receiveRealtimeClientEvent(t, conn.sent)
+	if got.Type != provider.RealtimeToolResultEvent || got.ToolResult == nil || !got.ToolResult.Partial ||
+		string(got.ToolResult.Output) != `{"ok":true}` || got.ToolResult.Media[0].Data[0] != 1 {
+		t.Fatalf("tool result event = %+v", got)
+	}
+
+	raw := json.RawMessage(`{"custom":{}}`)
+	if err := session.SendRaw(t.Context(), raw); err != nil {
+		t.Fatal(err)
+	}
+	raw[0] = 'x'
+	if got := receiveRealtimeClientEvent(t, conn.sent); got.Type != provider.RealtimeRawEvent || string(got.Raw) != `{"custom":{}}` {
+		t.Fatalf("raw event = %+v", got)
+	}
+
+	if err := session.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRealtimeSessionDeclaredToolsReachTheApplication(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	conn := newFakeRealtimeConnection(4, 4)
+	declared := Tool{Name: "approve", Description: "needs a human", InputSchema: json.RawMessage(`{"type":"object"}`)}
+	run := Tool{Name: "run", Execute: func(context.Context, json.RawMessage) (string, error) { return `{"ran":true}`, nil }}
+	session, err := OpenRealtimeSession(t.Context(), &fakeRealtimeModel{id: "test", conn: conn}, WithRealtimeTools(declared, run))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	conn.events <- provider.RealtimeEvent{Type: provider.RealtimeToolCallEvent, ToolCall: &provider.RealtimeToolCall{ID: "a", Name: "approve"}}
+	if got := receiveRealtimeEvent(t, session.Events()); got.ToolCall == nil || got.ToolCall.Name != "approve" {
+		t.Fatalf("declared tool call not delivered: %+v", got)
+	}
+	conn.events <- provider.RealtimeEvent{Type: provider.RealtimeToolCallEvent, ToolCall: &provider.RealtimeToolCall{ID: "r", Name: "run"}}
+	_ = receiveRealtimeEvent(t, session.Events())
+
+	// Only the executable tool is answered by the session.
+	if got := receiveRealtimeClientEvent(t, conn.sent); got.ToolResult == nil || got.ToolResult.ToolCallID != "r" {
+		t.Fatalf("unexpected automatic result: %+v", got)
+	}
+	select {
+	case got := <-conn.sent:
+		t.Fatalf("declared tool was answered automatically: %+v", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	if err := session.SendToolResult(t.Context(), provider.RealtimeToolResult{ToolCallID: "a", Output: json.RawMessage(`{"approved":true}`)}); err != nil {
+		t.Fatal(err)
+	}
+	if got := receiveRealtimeClientEvent(t, conn.sent); got.ToolResult == nil || got.ToolResult.ToolCallID != "a" {
+		t.Fatalf("application result = %+v", got)
+	}
+
+	if err := session.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRealtimeSessionRejectsDuplicateToolNames(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	conn := newFakeRealtimeConnection(1, 1)
+	model := &fakeRealtimeModel{id: "test", conn: conn}
+	_, err := OpenRealtimeSession(t.Context(), model, WithRealtimeTools(Tool{Name: "same"}, Tool{Name: "same"}))
+	if !errors.Is(err, provider.ErrInvalidRealtimeConfig) {
+		t.Fatalf("duplicate tools error = %v", err)
+	}
+}
+
+func TestRealtimeSessionUpdateSession(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	conn := newFakeRealtimeConnection(8, 8)
+	echo := func(name string) Tool {
+		return Tool{Name: name, Execute: func(context.Context, json.RawMessage) (string, error) { return `{"tool":"` + name + `"}`, nil }}
+	}
+	session, err := OpenRealtimeSession(t.Context(), &fakeRealtimeModel{id: "test", conn: conn}, WithRealtimeTools(echo("old")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	callTool := func(id, name string) *provider.RealtimeToolResult {
+		t.Helper()
+		conn.events <- provider.RealtimeEvent{Type: provider.RealtimeToolCallEvent, ToolCall: &provider.RealtimeToolCall{ID: id, Name: name}}
+		_ = receiveRealtimeEvent(t, session.Events())
+		return receiveRealtimeClientEvent(t, conn.sent).ToolResult
+	}
+
+	system := "be brief"
+	options := map[string]any{"nested": map[string]any{"k": "v"}}
+	if err := session.UpdateSession(t.Context(), RealtimeUpdate{System: &system, ProviderOptions: options}); err != nil {
+		t.Fatal(err)
+	}
+	system = "changed"
+	options["nested"].(map[string]any)["k"] = "changed"
+	got := receiveRealtimeClientEvent(t, conn.sent)
+	if got.Type != provider.RealtimeSessionUpdateEvent || got.Update == nil || *got.Update.System != "be brief" ||
+		got.Update.Tools != nil || got.Update.ProviderOptions["nested"].(map[string]any)["k"] != "v" {
+		t.Fatalf("update without tools = %+v", got.Update)
+	}
+	if result := callTool("1", "old"); result.IsError {
+		t.Fatalf("tools changed by an update without tools: %s", result.Output)
+	}
+
+	if err := session.UpdateSession(t.Context(), RealtimeUpdate{Tools: []Tool{echo("new")}}); err != nil {
+		t.Fatal(err)
+	}
+	got = receiveRealtimeClientEvent(t, conn.sent)
+	if got.Update == nil || got.Update.System != nil || len(got.Update.Tools) != 1 || got.Update.Tools[0].Name != "new" {
+		t.Fatalf("update with tools = %+v", got.Update)
+	}
+	if result := callTool("2", "new"); result.IsError || string(result.Output) != `{"tool":"new"}` {
+		t.Fatalf("new tool result = %+v", result)
+	}
+	if result := callTool("3", "old"); !result.IsError {
+		t.Fatalf("removed tool still runs: %s", result.Output)
+	}
+
+	if err := session.UpdateSession(t.Context(), RealtimeUpdate{Tools: []Tool{}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := receiveRealtimeClientEvent(t, conn.sent); got.Update == nil || got.Update.Tools == nil || len(got.Update.Tools) != 0 {
+		t.Fatalf("removing all tools must send an empty, non-nil list: %+v", got.Update)
+	}
+
+	if err := session.UpdateSession(t.Context(), RealtimeUpdate{Tools: []Tool{{Name: "x"}, {Name: "x"}}}); !errors.Is(err, provider.ErrInvalidRealtimeConfig) {
+		t.Fatalf("duplicate tools in update = %v", err)
+	}
+
+	if err := session.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRealtimeSessionUpdateRestoresToolsWhenSendFails(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	conn := newFakeRealtimeConnection(4, 4)
+	run := Tool{Name: "run", Execute: func(context.Context, json.RawMessage) (string, error) { return `{}`, nil }}
+	ran := make(chan error, 1)
+	session, err := OpenRealtimeSession(t.Context(), &fakeRealtimeModel{id: "test", conn: conn},
+		WithRealtimeTools(run),
+		WithRealtimeOnToolCall(func(info ToolCallInfo) { ran <- info.Error }),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_ = conn.Close() // the provider rejects every send from now on
+	if err := session.UpdateSession(t.Context(), RealtimeUpdate{Tools: []Tool{}}); !errors.Is(err, provider.ErrRealtimeSessionClosed) {
+		t.Fatalf("update error = %v", err)
+	}
+	conn.events <- provider.RealtimeEvent{Type: provider.RealtimeToolCallEvent, ToolCall: &provider.RealtimeToolCall{ID: "r", Name: "run"}}
+	_ = receiveRealtimeEvent(t, session.Events())
+	select {
+	case err := <-ran:
+		if err != nil {
+			t.Fatalf("the previous tools must stay active after a failed update: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("tool did not run")
+	}
+
+	if err := session.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRealtimeParityCloneHelpers(t *testing.T) {
+	system := "s"
+	event := provider.RealtimeClientEvent{
+		Raw:   json.RawMessage(`{}`),
+		Media: &provider.RealtimeMedia{MIMEType: "image/jpeg", Data: []byte{1}},
+		Conversation: &provider.RealtimeConversation{Messages: []provider.Message{{
+			Role:            provider.RoleUser,
+			ProviderOptions: map[string]any{"k": "v"},
+			Content: []provider.Part{{
+				Type: provider.PartToolCall, ToolInput: json.RawMessage(`{}`),
+				ProviderOptions: map[string]any{"k": "v"}, RemoteRef: &provider.RemoteFileRef{ID: "f", Data: []byte{1}},
+			}},
+		}}},
+		Update: &provider.RealtimeSessionUpdate{System: &system, Tools: []provider.ToolDefinition{}, ProviderOptions: map[string]any{"k": "v"}},
+		ToolResult: &provider.RealtimeToolResult{
+			Media:           []provider.RealtimeMedia{{Data: []byte{1}}},
+			ProviderOptions: map[string]any{"k": "v"},
+		},
+	}
+	clone := cloneRealtimeClientEvent(event)
+	event.Raw[0] = 'x'
+	event.Media.Data[0] = 9
+	msg := &event.Conversation.Messages[0]
+	msg.ProviderOptions["k"] = "changed"
+	msg.Content[0].ToolInput[0] = 'x'
+	msg.Content[0].ProviderOptions["k"] = "changed"
+	msg.Content[0].RemoteRef.ID = "changed"
+	msg.Content[0].RemoteRef.Data[0] = 9
+	*event.Update.System = "changed"
+	event.Update.ProviderOptions["k"] = "changed"
+	event.ToolResult.Media[0].Data[0] = 9
+	event.ToolResult.ProviderOptions["k"] = "changed"
+
+	cmsg := clone.Conversation.Messages[0]
+	if string(clone.Raw) != `{}` || clone.Media.Data[0] != 1 || cmsg.ProviderOptions["k"] != "v" ||
+		string(cmsg.Content[0].ToolInput) != `{}` || cmsg.Content[0].ProviderOptions["k"] != "v" || cmsg.Content[0].RemoteRef.ID != "f" || cmsg.Content[0].RemoteRef.Data[0] != 1 {
+		t.Fatalf("client event aliased: %+v", clone)
+	}
+	if *clone.Update.System != "s" || clone.Update.ProviderOptions["k"] != "v" || clone.Update.Tools == nil {
+		t.Fatalf("update aliased or empty tools lost: %+v", clone.Update)
+	}
+	if clone.ToolResult.Media[0].Data[0] != 1 || clone.ToolResult.ProviderOptions["k"] != "v" {
+		t.Fatalf("tool result aliased: %+v", clone.ToolResult)
+	}
+	if cloneToolDefinitions(nil) != nil || cloneRealtimeMessages(nil) != nil || cloneRealtimeMedia(nil) != nil {
+		t.Fatal("nil inputs must stay nil")
+	}
+
+	serverEvent := provider.RealtimeEvent{
+		Raw:     json.RawMessage(`{}`),
+		Media:   &provider.RealtimeMedia{Data: []byte{1}},
+		Sources: []provider.Source{{URL: "u", ProviderMetadata: map[string]any{"k": "v"}}},
+	}
+	cloned := cloneRealtimeEvent(serverEvent)
+	serverEvent.Raw[0] = 'x'
+	serverEvent.Media.Data[0] = 9
+	serverEvent.Sources[0].URL = "changed"
+	serverEvent.Sources[0].ProviderMetadata["k"] = "changed"
+	if string(cloned.Raw) != `{}` || cloned.Media.Data[0] != 1 || cloned.Sources[0].URL != "u" || cloned.Sources[0].ProviderMetadata["k"] != "v" {
+		t.Fatalf("event aliased: %+v", cloned)
+	}
+}

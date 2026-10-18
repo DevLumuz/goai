@@ -100,6 +100,7 @@ func (m *liveModel) RealtimeCapabilities() provider.RealtimeCapabilities {
 		ParallelToolCalls:    true,
 		UsageUpdates:         true,
 		Delegation:           true,
+		RawEvents:            true,
 		SupportedInputAudio:  formats,
 		SupportedOutputAudio: append([]provider.AudioFormat(nil), formats...),
 	}
@@ -156,13 +157,14 @@ func (m *liveModel) OpenRealtime(ctx context.Context, params provider.RealtimePa
 		inputTr:    params.InputTranscription.Enabled,
 		outputTr:   params.OutputTranscription.Enabled,
 		pending:    make(map[string]bool),
+		rawEvents:  params.IncludeRawEvents,
 	}
 	sessionID, err := c.start(ctx, session)
 	if err != nil {
 		c.abort()
 		return nil, err
 	}
-	c.events <- provider.RealtimeEvent{Type: provider.RealtimeSessionReady, SessionID: sessionID}
+	c.setup = append(c.setup, provider.RealtimeEvent{Type: provider.RealtimeSessionReady, SessionID: sessionID})
 	go c.readLoop()
 	return c, nil
 }
@@ -329,13 +331,17 @@ type liveConn struct {
 	delegation string
 	inputTr    bool
 	outputTr   bool
+	rawEvents  bool
 
 	// Responses delegation: once every pending function call has its output,
 	// a single response.create continues the backend.
 	pendingMu sync.Mutex
 	pending   map[string]bool
 
-	seq int64 // reader goroutine only
+	// Reader goroutine only. setup holds events produced while starting,
+	// delivered before anything the reader reads.
+	setup []provider.RealtimeEvent
+	seq   int64
 }
 
 func (c *liveConn) Events() <-chan provider.RealtimeEvent { return c.events }
@@ -393,12 +399,15 @@ func (c *liveConn) start(ctx context.Context, session map[string]any) (string, e
 		return "", fmt.Errorf("openai: sending session.start: %w", err)
 	}
 	for {
-		ev, err := c.read(ctx)
+		ev, data, err := c.read(ctx)
 		if err != nil {
 			return "", err
 		}
 		switch ev.Type {
 		case "session.started":
+			if c.rawEvents {
+				c.setup = append(c.setup, liveRawEvent(data))
+			}
 			if ev.Session != nil {
 				return ev.Session.ID, nil
 			}
@@ -406,27 +415,42 @@ func (c *liveConn) start(ctx context.Context, session map[string]any) (string, e
 		case "error":
 			return "", liveError(ev.Error)
 		}
+		c.setup = append(c.setup, c.translateMessage(ev, data)...)
 	}
 }
 
-func (c *liveConn) read(ctx context.Context) (liveServerEvent, error) {
+func (c *liveConn) read(ctx context.Context) (liveServerEvent, []byte, error) {
 	_, data, err := c.ws.Read(ctx)
 	if err != nil {
 		code, reason, ok := realtimews.CloseStatus(err)
 		switch {
 		case !ok:
-			return liveServerEvent{}, fmt.Errorf("openai: live connection lost: %w", err)
+			return liveServerEvent{}, nil, fmt.Errorf("openai: live connection lost: %w", err)
 		case code == realtimews.StatusNormalClosure:
-			return liveServerEvent{}, errLiveClosedNormally
+			return liveServerEvent{}, nil, errLiveClosedNormally
 		default:
-			return liveServerEvent{}, fmt.Errorf("openai: live session closed with status %d: %s", code, reason)
+			return liveServerEvent{}, nil, fmt.Errorf("openai: live session closed with status %d: %s", code, reason)
 		}
 	}
 	var ev liveServerEvent
 	if err := json.Unmarshal(data, &ev); err != nil {
-		return liveServerEvent{}, fmt.Errorf("openai: decoding live event: %w", err)
+		return liveServerEvent{}, nil, fmt.Errorf("openai: decoding live event: %w", err)
 	}
-	return ev, nil
+	return ev, data, nil
+}
+
+// translateMessage adds the raw event to its normalized events: always with
+// IncludeRawEvents, otherwise when the adapter does not know its type.
+func (c *liveConn) translateMessage(ev liveServerEvent, data []byte) []provider.RealtimeEvent {
+	events, known := c.translate(ev)
+	if !c.rawEvents && known {
+		return events
+	}
+	return append([]provider.RealtimeEvent{liveRawEvent(data)}, events...)
+}
+
+func liveRawEvent(data []byte) provider.RealtimeEvent {
+	return provider.RealtimeEvent{Type: provider.RealtimeProviderEvent, Raw: append(json.RawMessage(nil), data...)}
 }
 
 var errLiveClosedNormally = errors.New("openai: live connection closed")
@@ -462,6 +486,12 @@ func (c *liveConn) Send(ctx context.Context, event provider.RealtimeClientEvent)
 		return provider.ErrRealtimeSessionClosed
 	default:
 	}
+	if event.Type == provider.RealtimeRawEvent {
+		if !realtimews.IsJSONObject(event.Raw) {
+			return fmt.Errorf("%w: raw event must be a JSON object", provider.ErrInvalidRealtimeConfig)
+		}
+		return c.sendError(c.ws.Write(ctx, realtimews.MessageText, event.Raw))
+	}
 	msgs, err := c.encode(event)
 	if err != nil {
 		return err
@@ -479,13 +509,18 @@ func (c *liveConn) Send(ctx context.Context, event provider.RealtimeClientEvent)
 }
 
 func (c *liveConn) writeEvent(ctx context.Context, msg map[string]any) error {
-	if err := c.write(ctx, msg); err != nil {
-		if c.ctx.Err() != nil {
-			return provider.ErrRealtimeSessionClosed
-		}
-		return fmt.Errorf("openai: sending live event: %w", err)
+	return c.sendError(c.write(ctx, msg))
+}
+
+// sendError maps a failed write to the error a sender sees.
+func (c *liveConn) sendError(err error) error {
+	if err == nil {
+		return nil
 	}
-	return nil
+	if c.ctx.Err() != nil {
+		return provider.ErrRealtimeSessionClosed
+	}
+	return fmt.Errorf("openai: sending live event: %w", err)
 }
 
 func (c *liveConn) outputSent(callID string) bool {
@@ -568,8 +603,16 @@ func (c *liveConn) encodeContext(content *provider.RealtimeContext) ([]map[strin
 func (c *liveConn) readLoop() {
 	defer close(c.done)
 	defer close(c.events)
+	for _, event := range c.setup {
+		c.seq++
+		event.Sequence = c.seq
+		if !c.emit(event) {
+			return
+		}
+	}
+	c.setup = nil
 	for {
-		ev, err := c.read(c.ctx)
+		ev, data, err := c.read(c.ctx)
 		if err != nil {
 			if c.ctx.Err() == nil && !errors.Is(err, errLiveClosedNormally) {
 				select {
@@ -580,7 +623,7 @@ func (c *liveConn) readLoop() {
 			}
 			return
 		}
-		for _, event := range c.translate(ev) {
+		for _, event := range c.translateMessage(ev, data) {
 			c.seq++
 			event.Sequence = c.seq
 			if !c.emit(event) {
@@ -611,28 +654,29 @@ func (c *liveConn) emit(event provider.RealtimeEvent) bool {
 	}
 }
 
-// translate maps one server event to common events. Reader goroutine only.
-func (c *liveConn) translate(ev liveServerEvent) []provider.RealtimeEvent {
+// translate maps one server event to common events and reports whether the
+// adapter knows it. Reader goroutine only.
+func (c *liveConn) translate(ev liveServerEvent) ([]provider.RealtimeEvent, bool) {
 	switch ev.Type {
 	case "session.output_audio.delta":
 		audio, err := base64.StdEncoding.DecodeString(ev.Delta)
 		if err != nil {
-			return []provider.RealtimeEvent{{Type: provider.RealtimeError, Error: fmt.Errorf("openai: decoding live audio: %w", err)}}
+			return []provider.RealtimeEvent{{Type: provider.RealtimeError, Error: fmt.Errorf("openai: decoding live audio: %w", err)}}, true
 		}
-		return []provider.RealtimeEvent{{Type: provider.RealtimeOutputAudio, Audio: audio, AudioFormat: c.format}}
+		return []provider.RealtimeEvent{{Type: provider.RealtimeOutputAudio, Audio: audio, AudioFormat: c.format}}, true
 	case "session.input_transcript.delta":
 		if !c.inputTr {
-			return nil
+			return nil, true
 		}
-		return []provider.RealtimeEvent{{Type: provider.RealtimeInputTranscript, Text: ev.Delta}}
+		return []provider.RealtimeEvent{{Type: provider.RealtimeInputTranscript, Text: ev.Delta}}, true
 	case "session.output_transcript.delta":
 		if !c.outputTr {
-			return nil
+			return nil, true
 		}
-		return []provider.RealtimeEvent{{Type: provider.RealtimeOutputTranscript, Text: ev.Delta}}
+		return []provider.RealtimeEvent{{Type: provider.RealtimeOutputTranscript, Text: ev.Delta}}, true
 	case "session.delegation.created":
 		if ev.Delegation == nil {
-			return nil
+			return nil, false
 		}
 		return []provider.RealtimeEvent{{
 			Type:       provider.RealtimeDelegationCreated,
@@ -643,31 +687,31 @@ func (c *liveConn) translate(ev liveServerEvent) []provider.RealtimeEvent {
 				ResponseID: ev.Delegation.ResponseID,
 				Offset:     time.Duration(ev.OffsetMs) * time.Millisecond,
 			},
-		}}
+		}}, true
 	case "response.event":
 		return c.translateBackend(ev.Event)
 	case "session.usage.updated", "session.closed":
 		if ev.Usage == nil {
-			return nil
+			return nil, true
 		}
-		return []provider.RealtimeEvent{{Type: provider.RealtimeUsageUpdated, UsageDuration: time.Duration(ev.Usage.Seconds * float64(time.Second))}}
+		return []provider.RealtimeEvent{{Type: provider.RealtimeUsageUpdated, UsageDuration: time.Duration(ev.Usage.Seconds * float64(time.Second))}}, true
 	case "error":
-		return []provider.RealtimeEvent{{Type: provider.RealtimeError, Error: liveError(ev.Error)}}
+		return []provider.RealtimeEvent{{Type: provider.RealtimeError, Error: liveError(ev.Error)}}, true
 	}
-	return nil
+	return nil, false
 }
 
 // translateBackend reads a nested Responses event: completed function calls
 // become tool calls; backend failures become error events.
-func (c *liveConn) translateBackend(raw json.RawMessage) []provider.RealtimeEvent {
+func (c *liveConn) translateBackend(raw json.RawMessage) ([]provider.RealtimeEvent, bool) {
 	var ev liveBackendEvent
 	if len(raw) == 0 || json.Unmarshal(raw, &ev) != nil {
-		return nil
+		return nil, false
 	}
 	switch ev.Type {
 	case "response.output_item.done":
 		if ev.Item == nil || ev.Item.Type != "function_call" {
-			return nil
+			return nil, false
 		}
 		c.pendingMu.Lock()
 		c.pending[ev.Item.CallID] = true
@@ -680,19 +724,19 @@ func (c *liveConn) translateBackend(raw json.RawMessage) []provider.RealtimeEven
 			Type:       provider.RealtimeToolCallEvent,
 			ToolCallID: ev.Item.CallID,
 			ToolCall:   &provider.RealtimeToolCall{ID: ev.Item.CallID, Name: ev.Item.Name, Input: input},
-		}}
+		}}, true
 	case "response.failed":
 		var e *liveWireError
 		if ev.Response != nil {
 			e = ev.Response.Error
 		}
-		return []provider.RealtimeEvent{{Type: provider.RealtimeError, Error: fmt.Errorf("openai: live backend response failed: %w", liveError(e))}}
+		return []provider.RealtimeEvent{{Type: provider.RealtimeError, Error: fmt.Errorf("openai: live backend response failed: %w", liveError(e))}}, true
 	case "error":
 		e := ev.Error
 		if e == nil {
 			e = &liveWireError{Code: ev.Code, Message: ev.Message}
 		}
-		return []provider.RealtimeEvent{{Type: provider.RealtimeError, Error: fmt.Errorf("openai: live backend: %w", liveError(e))}}
+		return []provider.RealtimeEvent{{Type: provider.RealtimeError, Error: fmt.Errorf("openai: live backend: %w", liveError(e))}}, true
 	}
-	return nil
+	return nil, false
 }

@@ -8,6 +8,7 @@ import "encoding/json"
 
 type serverEvent struct {
 	Type         string          `json:"type"`
+	Session      *wireSession    `json:"session"`
 	Error        *wireError      `json:"error"`
 	ItemID       string          `json:"item_id"`
 	ResponseID   string          `json:"response_id"`
@@ -20,6 +21,10 @@ type serverEvent struct {
 	RateLimits   []wireRateLimit `json:"rate_limits"`
 	AudioStartMs int64           `json:"audio_start_ms"`
 	AudioEndMs   int64           `json:"audio_end_ms"`
+}
+
+type wireSession struct {
+	ID string `json:"id"`
 }
 
 type wireError struct {

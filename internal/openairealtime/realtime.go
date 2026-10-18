@@ -89,6 +89,7 @@ func (m *model) RealtimeCapabilities() provider.RealtimeCapabilities {
 		ParallelToolCalls:       true,
 		UsageUpdates:            true,
 		RateLimitUpdates:        true,
+		RawEvents:               true,
 		SupportedInputAudio:     formats,
 		SupportedOutputAudio:    append([]provider.AudioFormat(nil), formats...),
 	}
@@ -141,6 +142,7 @@ func (m *model) OpenRealtime(ctx context.Context, params provider.RealtimeParams
 		outFormat:    outFormat,
 		autoResponse: !params.TurnDetection.DisableAutoResponse,
 		outputTr:     params.OutputTranscription.Enabled,
+		rawEvents:    params.IncludeRawEvents,
 		pending:      make(map[string]bool),
 		audioMs:      make(map[string]int64),
 	}
@@ -148,7 +150,7 @@ func (m *model) OpenRealtime(ctx context.Context, params provider.RealtimeParams
 		c.abort()
 		return nil, err
 	}
-	c.events <- provider.RealtimeEvent{Type: provider.RealtimeSessionReady}
+	c.setup = append(c.setup, provider.RealtimeEvent{Type: provider.RealtimeSessionReady, SessionID: c.sessionID})
 	go c.readLoop()
 	return c, nil
 }
@@ -366,6 +368,7 @@ type conn struct {
 	outFormat    provider.AudioFormat
 	autoResponse bool
 	outputTr     bool
+	rawEvents    bool
 
 	// stateMu guards response sequencing, the tool loop, and audio lengths.
 	// Like the official Agents SDK, response.create is never sent while a
@@ -379,7 +382,11 @@ type conn struct {
 	respDone       bool
 	audioMs        map[string]int64 // received output audio per item, for truncation
 
-	seq int64 // reader goroutine only
+	// Reader goroutine only. setup holds events produced while configuring,
+	// delivered before anything the reader reads.
+	setup     []provider.RealtimeEvent
+	sessionID string
+	seq       int64
 }
 
 func (c *conn) Events() <-chan provider.RealtimeEvent { return c.events }
@@ -428,7 +435,7 @@ func (c *conn) configure(ctx context.Context, session map[string]any) error {
 		return fmt.Errorf("%s: sending session.update: %w", c.provider, err)
 	}
 	for {
-		ev, err := c.read(ctx)
+		ev, data, err := c.read(ctx)
 		if err != nil {
 			if errors.Is(err, errClosedNormally) {
 				return fmt.Errorf("%s: realtime connection closed during setup", c.provider)
@@ -437,26 +444,44 @@ func (c *conn) configure(ctx context.Context, session map[string]any) error {
 		}
 		switch ev.Type {
 		case "session.updated":
+			if c.rawEvents {
+				c.setup = append(c.setup, rawEvent(data))
+			}
 			return nil
 		case "error":
 			return c.serverError(ev.Error)
 		}
+		c.setup = append(c.setup, c.translateMessage(ev, data)...)
 	}
 }
 
-func (c *conn) read(ctx context.Context) (serverEvent, error) {
+func (c *conn) read(ctx context.Context) (serverEvent, []byte, error) {
 	_, data, err := c.ws.Read(ctx)
 	if err != nil {
 		if closeErr := c.closeError(err); closeErr != nil {
-			return serverEvent{}, closeErr
+			return serverEvent{}, nil, closeErr
 		}
-		return serverEvent{}, errClosedNormally
+		return serverEvent{}, nil, errClosedNormally
 	}
 	var ev serverEvent
 	if err := json.Unmarshal(data, &ev); err != nil {
-		return serverEvent{}, fmt.Errorf("%s: decoding realtime event: %w", c.provider, err)
+		return serverEvent{}, nil, fmt.Errorf("%s: decoding realtime event: %w", c.provider, err)
 	}
-	return ev, nil
+	return ev, data, nil
+}
+
+// translateMessage adds the raw event to its normalized events: always with
+// IncludeRawEvents, otherwise when the adapter does not know its type.
+func (c *conn) translateMessage(ev serverEvent, data []byte) []provider.RealtimeEvent {
+	events, known := c.translate(ev)
+	if !c.rawEvents && known {
+		return events
+	}
+	return append([]provider.RealtimeEvent{rawEvent(data)}, events...)
+}
+
+func rawEvent(data []byte) provider.RealtimeEvent {
+	return provider.RealtimeEvent{Type: provider.RealtimeProviderEvent, Raw: append(json.RawMessage(nil), data...)}
 }
 
 func (c *conn) closeError(err error) error {
@@ -496,6 +521,12 @@ func (c *conn) Send(ctx context.Context, event provider.RealtimeClientEvent) err
 	if c.ctx.Err() != nil {
 		return provider.ErrRealtimeSessionClosed
 	}
+	if event.Type == provider.RealtimeRawEvent {
+		if !realtimews.IsJSONObject(event.Raw) {
+			return fmt.Errorf("%w: raw event must be a JSON object", provider.ErrInvalidRealtimeConfig)
+		}
+		return c.sendError(c.ws.Write(ctx, realtimews.MessageText, event.Raw))
+	}
 	msgs, respond, err := c.encode(event)
 	if err != nil {
 		return err
@@ -517,13 +548,18 @@ func (c *conn) Send(ctx context.Context, event provider.RealtimeClientEvent) err
 }
 
 func (c *conn) writeEvent(ctx context.Context, msg clientEvent) error {
-	if err := c.write(ctx, msg); err != nil {
-		if c.ctx.Err() != nil {
-			return provider.ErrRealtimeSessionClosed
-		}
-		return fmt.Errorf("%s: sending realtime event: %w", c.provider, err)
+	return c.sendError(c.write(ctx, msg))
+}
+
+// sendError maps a failed write to the error a sender sees.
+func (c *conn) sendError(err error) error {
+	if err == nil {
+		return nil
 	}
-	return nil
+	if c.ctx.Err() != nil {
+		return provider.ErrRealtimeSessionClosed
+	}
+	return fmt.Errorf("%s: sending realtime event: %w", c.provider, err)
 }
 
 // requestResponse reports whether response.create can be sent now. Otherwise
@@ -624,8 +660,12 @@ func (c *conn) continueToolTurn() bool {
 func (c *conn) readLoop() {
 	defer close(c.done)
 	defer close(c.events)
+	if !c.emit(c.setup) {
+		return
+	}
+	c.setup = nil
 	for {
-		ev, err := c.read(c.ctx)
+		ev, data, err := c.read(c.ctx)
 		if err != nil {
 			if c.ctx.Err() == nil {
 				if !errors.Is(err, errClosedNormally) {
@@ -635,15 +675,8 @@ func (c *conn) readLoop() {
 			}
 			return
 		}
-		for _, event := range c.translate(ev) {
-			c.seq++
-			event.Sequence = c.seq
-			select {
-			case c.events <- event:
-			case <-c.closing:
-			case <-c.ctx.Done():
-				return
-			}
+		if !c.emit(c.translateMessage(ev, data)) {
+			return
 		}
 		if ev.Type == "response.done" && c.finishResponse() {
 			if err := c.write(c.ctx, clientEvent{"type": "response.create"}); err != nil && c.ctx.Err() == nil {
@@ -651,6 +684,22 @@ func (c *conn) readLoop() {
 			}
 		}
 	}
+}
+
+// emit delivers events in order and reports false once the connection ends.
+// After Close they are dropped so the reader can finish the close handshake.
+func (c *conn) emit(events []provider.RealtimeEvent) bool {
+	for _, event := range events {
+		c.seq++
+		event.Sequence = c.seq
+		select {
+		case c.events <- event:
+		case <-c.closing:
+		case <-c.ctx.Done():
+			return false
+		}
+	}
+	return true
 }
 
 // finishResponse closes the active response and reports whether a
@@ -671,19 +720,26 @@ func (c *conn) finishResponse() bool {
 	return false
 }
 
-// translate maps one server event to common events. Reader goroutine only.
-func (c *conn) translate(ev serverEvent) []provider.RealtimeEvent {
+// translate maps one server event to common events and reports whether the
+// adapter knows its type. Reader goroutine only.
+func (c *conn) translate(ev serverEvent) ([]provider.RealtimeEvent, bool) {
 	switch ev.Type {
+	case "session.created":
+		// The session ID travels on RealtimeSessionReady, sent once configured.
+		if ev.Session != nil {
+			c.sessionID = ev.Session.ID
+		}
+		return nil, true
 	case "input_audio_buffer.speech_started":
-		return []provider.RealtimeEvent{{Type: provider.RealtimeInputSpeechStarted, ItemID: ev.ItemID}}
+		return []provider.RealtimeEvent{{Type: provider.RealtimeInputSpeechStarted, ItemID: ev.ItemID}}, true
 	case "input_audio_buffer.speech_stopped":
-		return []provider.RealtimeEvent{{Type: provider.RealtimeInputSpeechStopped, ItemID: ev.ItemID}}
+		return []provider.RealtimeEvent{{Type: provider.RealtimeInputSpeechStopped, ItemID: ev.ItemID}}, true
 	case "conversation.item.input_audio_transcription.delta":
-		return []provider.RealtimeEvent{{Type: provider.RealtimeInputTranscript, ItemID: ev.ItemID, Text: ev.Delta}}
+		return []provider.RealtimeEvent{{Type: provider.RealtimeInputTranscript, ItemID: ev.ItemID, Text: ev.Delta}}, true
 	case "conversation.item.input_audio_transcription.completed":
-		return []provider.RealtimeEvent{{Type: provider.RealtimeInputTranscript, ItemID: ev.ItemID, Text: ev.Transcript, IsFinal: true}}
+		return []provider.RealtimeEvent{{Type: provider.RealtimeInputTranscript, ItemID: ev.ItemID, Text: ev.Transcript, IsFinal: true}}, true
 	case "conversation.item.input_audio_transcription.failed":
-		return []provider.RealtimeEvent{{Type: provider.RealtimeError, ItemID: ev.ItemID, Error: c.serverError(ev.Error)}}
+		return []provider.RealtimeEvent{{Type: provider.RealtimeError, ItemID: ev.ItemID, Error: c.serverError(ev.Error)}}, true
 	case "response.created":
 		c.stateMu.Lock()
 		c.ongoing, c.createInFlight = true, false
@@ -694,28 +750,28 @@ func (c *conn) translate(ev serverEvent) []provider.RealtimeEvent {
 		if ev.Response != nil {
 			id = ev.Response.ID
 		}
-		return []provider.RealtimeEvent{{Type: provider.RealtimeResponseStarted, ResponseID: id}}
+		return []provider.RealtimeEvent{{Type: provider.RealtimeResponseStarted, ResponseID: id}}, true
 	case "response.output_audio.delta":
 		audio, err := base64.StdEncoding.DecodeString(ev.Delta)
 		if err != nil {
-			return []provider.RealtimeEvent{{Type: provider.RealtimeError, Error: fmt.Errorf("%s: decoding output audio: %w", c.provider, err)}}
+			return []provider.RealtimeEvent{{Type: provider.RealtimeError, Error: fmt.Errorf("%s: decoding output audio: %w", c.provider, err)}}, true
 		}
 		c.stateMu.Lock()
 		c.audioMs[ev.ItemID] += audioDuration(len(audio), c.outFormat)
 		c.stateMu.Unlock()
-		return []provider.RealtimeEvent{{Type: provider.RealtimeOutputAudio, ResponseID: ev.ResponseID, ItemID: ev.ItemID, Audio: audio, AudioFormat: c.outFormat}}
+		return []provider.RealtimeEvent{{Type: provider.RealtimeOutputAudio, ResponseID: ev.ResponseID, ItemID: ev.ItemID, Audio: audio, AudioFormat: c.outFormat}}, true
 	case "response.output_audio_transcript.delta":
 		if !c.outputTr {
-			return nil
+			return nil, true
 		}
-		return []provider.RealtimeEvent{{Type: provider.RealtimeOutputTranscript, ResponseID: ev.ResponseID, ItemID: ev.ItemID, Text: ev.Delta}}
+		return []provider.RealtimeEvent{{Type: provider.RealtimeOutputTranscript, ResponseID: ev.ResponseID, ItemID: ev.ItemID, Text: ev.Delta}}, true
 	case "response.output_audio_transcript.done":
 		if !c.outputTr {
-			return nil
+			return nil, true
 		}
-		return []provider.RealtimeEvent{{Type: provider.RealtimeOutputTranscript, ResponseID: ev.ResponseID, ItemID: ev.ItemID, Text: ev.Transcript, IsFinal: true}}
+		return []provider.RealtimeEvent{{Type: provider.RealtimeOutputTranscript, ResponseID: ev.ResponseID, ItemID: ev.ItemID, Text: ev.Transcript, IsFinal: true}}, true
 	case "response.output_text.delta":
-		return []provider.RealtimeEvent{{Type: provider.RealtimeTextDelta, ResponseID: ev.ResponseID, ItemID: ev.ItemID, Text: ev.Delta}}
+		return []provider.RealtimeEvent{{Type: provider.RealtimeTextDelta, ResponseID: ev.ResponseID, ItemID: ev.ItemID, Text: ev.Delta}}, true
 	case "response.function_call_arguments.done":
 		c.stateMu.Lock()
 		c.pending[ev.CallID] = true
@@ -731,9 +787,9 @@ func (c *conn) translate(ev serverEvent) []provider.RealtimeEvent {
 			ItemID:     ev.ItemID,
 			ToolCallID: ev.CallID,
 			ToolCall:   &provider.RealtimeToolCall{ID: ev.CallID, Name: ev.Name, Input: input},
-		}}
+		}}, true
 	case "response.done":
-		return c.responseDone(ev.Response)
+		return c.responseDone(ev.Response), true
 	case "rate_limits.updated":
 		limits := make([]provider.RealtimeRateLimit, 0, len(ev.RateLimits))
 		for _, rl := range ev.RateLimits {
@@ -744,7 +800,7 @@ func (c *conn) translate(ev serverEvent) []provider.RealtimeEvent {
 				ResetAfter: secondsToDuration(rl.ResetSeconds),
 			})
 		}
-		return []provider.RealtimeEvent{{Type: provider.RealtimeRateLimitsUpdated, RateLimits: limits}}
+		return []provider.RealtimeEvent{{Type: provider.RealtimeRateLimitsUpdated, RateLimits: limits}}, true
 	case "error":
 		if ev.Error != nil && ev.Error.Code == "conversation_already_has_active_response" {
 			// Our request raced a server-created response: retry after it ends.
@@ -752,9 +808,9 @@ func (c *conn) translate(ev serverEvent) []provider.RealtimeEvent {
 			c.createInFlight, c.wantCreate = false, true
 			c.stateMu.Unlock()
 		}
-		return []provider.RealtimeEvent{{Type: provider.RealtimeError, Error: c.serverError(ev.Error)}}
+		return []provider.RealtimeEvent{{Type: provider.RealtimeError, Error: c.serverError(ev.Error)}}, true
 	}
-	return nil
+	return nil, false
 }
 
 // audioDuration returns the milliseconds of audio in n bytes of format f.

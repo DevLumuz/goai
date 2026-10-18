@@ -317,7 +317,7 @@ func TestServerEvents(t *testing.T) {
 
 func TestOutputTranscriptsOnlyWhenEnabled(t *testing.T) {
 	c := newTestConn()
-	if evs := c.translate(serverEvent{Type: "response.output_audio_transcript.delta", Delta: "x"}); len(evs) != 0 {
+	if evs, known := c.translate(serverEvent{Type: "response.output_audio_transcript.delta", Delta: "x"}); len(evs) != 0 || !known {
 		t.Fatalf("transcript emitted without OutputTranscription: %+v", evs)
 	}
 }
@@ -762,7 +762,7 @@ func TestConnectionErrors(t *testing.T) {
 	})
 
 	t.Run("bad audio base64", func(t *testing.T) {
-		evs := newTestConn().translate(serverEvent{Type: "response.output_audio.delta", Delta: "!!"})
+		evs, _ := newTestConn().translate(serverEvent{Type: "response.output_audio.delta", Delta: "!!"})
 		if len(evs) != 1 || evs[0].Type != provider.RealtimeError {
 			t.Fatalf("events = %+v", evs)
 		}
@@ -806,7 +806,7 @@ func TestCapabilitiesAndURL(t *testing.T) {
 		t.Fatalf("ModelID = %q", model.ModelID())
 	}
 	caps := provider.RealtimeCapabilitiesOf(model)
-	if !caps.OutputAudioTruncation || !caps.ExplicitResponseRequest || caps.ClientVAD || caps.SessionResumption {
+	if !caps.OutputAudioTruncation || !caps.ExplicitResponseRequest || !caps.RawEvents || caps.ClientVAD || caps.SessionResumption {
 		t.Fatalf("capabilities = %+v", caps)
 	}
 	if got, _ := realtimeURL("https://res.openai.azure.com/openai/v1/", "my deploy"); got != "wss://res.openai.azure.com/openai/v1/realtime?model=my+deploy" {
@@ -832,7 +832,81 @@ func FuzzTranslate(f *testing.F) {
 		}
 		c := newTestConn()
 		c.outputTr = true
-		_ = c.translate(ev)
+		_ = c.translateMessage(ev, data)
 		_ = c.finishResponse()
 	})
+}
+
+func TestRawEvents(t *testing.T) {
+	verifyNoLeaks(t)
+
+	unknown := `{"type":"conversation.item.added","item":{"id":"i1"}}`
+	received := make(chan map[string]any, 1)
+	server := testServer(t, func(ctx context.Context, conn *websocket.Conn, _ *http.Request) {
+		acceptSession(t, ctx, conn)
+		sendEvent(t, ctx, conn, unknown)
+		sendEvent(t, ctx, conn, `{"type":"input_audio_buffer.speech_started","item_id":"u"}`)
+		received <- readEvent(t, ctx, conn)
+		drain(ctx, conn)
+	})
+
+	conn, err := testModel(server.URL).OpenRealtime(t.Context(), provider.RealtimeParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	if ev := next(t, conn); ev.Type != provider.RealtimeSessionReady || ev.SessionID != "sess_1" {
+		t.Fatalf("ready = %+v", ev)
+	}
+	if ev := next(t, conn); ev.Type != provider.RealtimeProviderEvent || string(ev.Raw) != unknown {
+		t.Fatalf("unknown event = %+v", ev)
+	}
+	if ev := next(t, conn); ev.Type != provider.RealtimeInputSpeechStarted || ev.Raw != nil {
+		t.Fatalf("known events carry no raw copy: %+v", ev)
+	}
+
+	if err := conn.Send(t.Context(), provider.RealtimeClientEvent{Type: provider.RealtimeRawEvent, Raw: json.RawMessage(`{"type":"input_audio_buffer.clear"}`)}); err != nil {
+		t.Fatal(err)
+	}
+	if got := <-received; got["type"] != "input_audio_buffer.clear" {
+		t.Fatalf("raw event = %v", got)
+	}
+	if err := conn.Send(t.Context(), provider.RealtimeClientEvent{Type: provider.RealtimeRawEvent, Raw: json.RawMessage(`[1]`)}); !errors.Is(err, provider.ErrInvalidRealtimeConfig) {
+		t.Fatalf("invalid raw error = %v", err)
+	}
+}
+
+func TestIncludeRawEvents(t *testing.T) {
+	verifyNoLeaks(t)
+
+	started := `{"type":"input_audio_buffer.speech_started","item_id":"u"}`
+	server := testServer(t, func(ctx context.Context, conn *websocket.Conn, _ *http.Request) {
+		acceptSession(t, ctx, conn)
+		sendEvent(t, ctx, conn, started)
+		drain(ctx, conn)
+	})
+
+	conn, err := testModel(server.URL).OpenRealtime(t.Context(), provider.RealtimeParams{IncludeRawEvents: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	want := []struct {
+		typ provider.RealtimeEventType
+		raw string
+	}{
+		{provider.RealtimeProviderEvent, `{"type":"session.created","session":{"id":"sess_1"}}`},
+		{provider.RealtimeProviderEvent, `{"type":"session.updated","session":{"id":"sess_1"}}`},
+		{provider.RealtimeSessionReady, ""},
+		{provider.RealtimeProviderEvent, started},
+		{provider.RealtimeInputSpeechStarted, ""},
+	}
+	for i, w := range want {
+		ev := next(t, conn)
+		if ev.Type != w.typ || string(ev.Raw) != w.raw || ev.Sequence != int64(i+1) {
+			t.Fatalf("event %d = %s %s seq %d, want %s %s", i, ev.Type, ev.Raw, ev.Sequence, w.typ, w.raw)
+		}
+	}
 }

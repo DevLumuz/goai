@@ -53,7 +53,9 @@ func WithRealtimeSystem(system string) RealtimeOption {
 }
 
 // WithRealtimeTools registers tools available to the model. Tools with Execute
-// handlers are dispatched automatically when the provider emits a tool call.
+// handlers are dispatched automatically when the provider emits a tool call;
+// calls to tools without Execute reach the application, which answers them
+// with RealtimeSession.SendToolResult.
 func WithRealtimeTools(tools ...Tool) RealtimeOption {
 	return func(o *realtimeOptions) { o.tools = append([]Tool(nil), tools...) }
 }
@@ -95,6 +97,12 @@ func WithRealtimeOutputTranscription(config provider.TranscriptionConfig) Realti
 // provider default.
 func WithRealtimeMaxOutputTokens(n int) RealtimeOption {
 	return func(o *realtimeOptions) { o.params.MaxOutputTokens = n }
+}
+
+// WithRealtimeRawEvents delivers every provider message as a
+// provider.RealtimeProviderEvent in addition to the normalized events.
+func WithRealtimeRawEvents(enabled bool) RealtimeOption {
+	return func(o *realtimeOptions) { o.params.IncludeRawEvents = enabled }
 }
 
 // WithRealtimeProviderOptions sets experimental provider-specific session fields.
@@ -202,7 +210,10 @@ type RealtimeSession struct {
 	errMu sync.RWMutex
 	err   error
 
-	tools         map[string]Tool
+	// updateMu serializes UpdateSession so the tool registry matches the last
+	// update the provider received.
+	updateMu      sync.Mutex
+	tools         atomic.Pointer[realtimeTools]
 	toolHooks     toolHooks
 	toolTimeout   time.Duration
 	toolSlots     chan struct{}
@@ -211,6 +222,35 @@ type RealtimeSession struct {
 	toolSequence  atomic.Int64
 	onEvent       []func(provider.RealtimeEvent)
 	onPanic       []func(PanicInfo)
+}
+
+// realtimeTools is the tool registry of a session. Declared holds every tool
+// offered to the model; executable only those the session runs itself.
+type realtimeTools struct {
+	declared   map[string]struct{}
+	executable map[string]Tool
+}
+
+func newRealtimeTools(tools []Tool) (*realtimeTools, error) {
+	executable, err := buildToolMap(tools)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", provider.ErrInvalidRealtimeConfig, err)
+	}
+	declared := make(map[string]struct{}, len(tools))
+	for _, tool := range tools {
+		if tool.Name != "" {
+			declared[tool.Name] = struct{}{}
+		}
+	}
+	return &realtimeTools{declared: declared, executable: executable}, nil
+}
+
+// RealtimeUpdate changes a live session. Nil fields keep the current value; a
+// non-nil empty Tools removes every tool.
+type RealtimeUpdate struct {
+	System          *string
+	Tools           []Tool
+	ProviderOptions map[string]any
 }
 
 // OpenRealtimeSession opens a realtime provider connection and starts its event
@@ -241,6 +281,10 @@ func OpenRealtimeSession(ctx context.Context, model provider.RealtimeModel, opts
 		return nil, fmt.Errorf("%w: max parallel tools must be positive", provider.ErrInvalidRealtimeConfig)
 	}
 
+	registry, err := newRealtimeTools(o.tools)
+	if err != nil {
+		return nil, err
+	}
 	o.params.Tools = ToolDefinitions(o.tools)
 	o.params = cloneRealtimeParams(o.params)
 	if err := o.params.Validate(); err != nil {
@@ -256,10 +300,6 @@ func OpenRealtimeSession(ctx context.Context, model provider.RealtimeModel, opts
 	}
 
 	sessionCtx, cancel := context.WithCancel(ctx)
-	toolMap := make(map[string]Tool, len(o.tools))
-	for _, tool := range o.tools {
-		toolMap[tool.Name] = tool
-	}
 	parallel := o.maxParallelTools
 	if o.sequentialTools {
 		parallel = 1
@@ -272,7 +312,6 @@ func OpenRealtimeSession(ctx context.Context, model provider.RealtimeModel, opts
 		events:           make(chan provider.RealtimeEvent, o.eventBuffer),
 		done:             make(chan struct{}),
 		backpressureWait: o.backpressureWait,
-		tools:            toolMap,
 		toolHooks: toolHooks{
 			sequential:      true,
 			onToolCallStart: o.onToolCallStart,
@@ -288,6 +327,7 @@ func OpenRealtimeSession(ctx context.Context, model provider.RealtimeModel, opts
 		onPanic:     append([]func(PanicInfo){}, o.onPanic...),
 	}
 
+	s.tools.Store(registry)
 	s.wg.Add(1)
 	go s.consume()
 	go func() {
@@ -350,6 +390,64 @@ func (s *RealtimeSession) Interrupt(ctx context.Context, cursor *provider.Playba
 // provider.ErrRealtimeUnsupported.
 func (s *RealtimeSession) AppendContext(ctx context.Context, content provider.RealtimeContext) error {
 	return s.send(ctx, provider.RealtimeClientEvent{Type: provider.RealtimeContextAppend, Context: &content})
+}
+
+// InputImage sends an encoded image or video frame, such as a JPEG camera
+// frame. Capturing and encoding are up to the application.
+func (s *RealtimeSession) InputImage(ctx context.Context, media provider.RealtimeMedia) error {
+	return s.send(ctx, provider.RealtimeClientEvent{Type: provider.RealtimeImageInput, Media: &media})
+}
+
+// EndInputAudio reports that the input audio stream paused or ended, so the
+// provider can flush buffered audio instead of waiting for more.
+func (s *RealtimeSession) EndInputAudio(ctx context.Context) error {
+	return s.send(ctx, provider.RealtimeClientEvent{Type: provider.RealtimeInputAudioEnd})
+}
+
+// AppendConversation adds messages to the conversation history, for example to
+// restore an earlier conversation.
+func (s *RealtimeSession) AppendConversation(ctx context.Context, conversation provider.RealtimeConversation) error {
+	return s.send(ctx, provider.RealtimeClientEvent{Type: provider.RealtimeConversationAppend, Conversation: &conversation})
+}
+
+// UpdateSession changes the instructions, tools, or provider settings of the
+// live session. New tools are dispatched like those given at open.
+func (s *RealtimeSession) UpdateSession(ctx context.Context, update RealtimeUpdate) error {
+	wire := &provider.RealtimeSessionUpdate{System: update.System, ProviderOptions: update.ProviderOptions}
+	if update.Tools == nil {
+		return s.send(ctx, provider.RealtimeClientEvent{Type: provider.RealtimeSessionUpdateEvent, Update: wire})
+	}
+	registry, err := newRealtimeTools(update.Tools)
+	if err != nil {
+		return err
+	}
+	wire.Tools = ToolDefinitions(update.Tools)
+	if wire.Tools == nil {
+		wire.Tools = []provider.ToolDefinition{}
+	}
+
+	// The registry changes first: calls the provider makes after applying the
+	// update must find the new tools, and removed tools must stop running.
+	s.updateMu.Lock()
+	defer s.updateMu.Unlock()
+	previous := s.tools.Swap(registry)
+	if err := s.send(ctx, provider.RealtimeClientEvent{Type: provider.RealtimeSessionUpdateEvent, Update: wire}); err != nil {
+		s.tools.Store(previous)
+		return err
+	}
+	return nil
+}
+
+// SendToolResult answers a call to a tool registered without Execute. Partial
+// results are allowed where the capabilities report PartialToolResults.
+func (s *RealtimeSession) SendToolResult(ctx context.Context, result provider.RealtimeToolResult) error {
+	return s.send(ctx, provider.RealtimeClientEvent{Type: provider.RealtimeToolResultEvent, ToolResult: &result})
+}
+
+// SendRaw writes a provider message as given, for features without a typed
+// method. It bypasses the adapter's state tracking.
+func (s *RealtimeSession) SendRaw(ctx context.Context, raw json.RawMessage) error {
+	return s.send(ctx, provider.RealtimeClientEvent{Type: provider.RealtimeRawEvent, Raw: raw})
 }
 
 // Close terminates the session and waits for its internal goroutines. It is idempotent.
@@ -445,8 +543,16 @@ func (s *RealtimeSession) publish(event provider.RealtimeEvent) bool {
 func (s *RealtimeSession) handleInternalEvent(event provider.RealtimeEvent) {
 	switch event.Type {
 	case provider.RealtimeToolCallEvent:
-		if event.ToolCall != nil {
-			s.startTool(*event.ToolCall)
+		if event.ToolCall == nil {
+			return
+		}
+		registry := s.tools.Load()
+		_, executable := registry.executable[event.ToolCall.Name]
+		_, declared := registry.declared[event.ToolCall.Name]
+		// A declared tool without Execute is the application's to answer; an
+		// unknown one gets an error result so the model is not left waiting.
+		if executable || !declared {
+			s.startTool(*event.ToolCall, registry.executable)
 		}
 	case provider.RealtimeToolCallCancelled:
 		if event.ToolCallID != "" {
@@ -455,7 +561,7 @@ func (s *RealtimeSession) handleInternalEvent(event provider.RealtimeEvent) {
 	}
 }
 
-func (s *RealtimeSession) startTool(call provider.RealtimeToolCall) {
+func (s *RealtimeSession) startTool(call provider.RealtimeToolCall, tools map[string]Tool) {
 	input := append(json.RawMessage(nil), call.Input...)
 	call.Input = input
 
@@ -486,7 +592,7 @@ func (s *RealtimeSession) startTool(call provider.RealtimeToolCall) {
 		step := int(s.toolSequence.Add(1))
 		_, results := executeToolsParallel(toolCtx, []provider.ToolCall{{
 			ID: call.ID, Name: call.Name, Input: call.Input,
-		}}, s.tools, step, s.toolHooks)
+		}}, tools, step, s.toolHooks)
 		if len(results) == 0 || toolCtx.Err() != nil && errors.Is(toolCtx.Err(), context.Canceled) {
 			return
 		}
@@ -572,11 +678,7 @@ func (s *RealtimeSession) setErr(err error) {
 }
 
 func cloneRealtimeParams(params provider.RealtimeParams) provider.RealtimeParams {
-	params.Tools = append([]provider.ToolDefinition(nil), params.Tools...)
-	for i := range params.Tools {
-		params.Tools[i].InputSchema = append(json.RawMessage(nil), params.Tools[i].InputSchema...)
-		params.Tools[i].ProviderDefinedOptions = cloneAnyMap(params.Tools[i].ProviderDefinedOptions)
-	}
+	params.Tools = cloneToolDefinitions(params.Tools)
 	params.TurnDetection.ProviderOptions = cloneAnyMap(params.TurnDetection.ProviderOptions)
 	params.InputTranscription.ProviderOptions = cloneAnyMap(params.InputTranscription.ProviderOptions)
 	params.OutputTranscription.ProviderOptions = cloneAnyMap(params.OutputTranscription.ProviderOptions)
@@ -586,7 +688,24 @@ func cloneRealtimeParams(params provider.RealtimeParams) provider.RealtimeParams
 
 func cloneRealtimeClientEvent(event provider.RealtimeClientEvent) provider.RealtimeClientEvent {
 	event.Audio = append([]byte(nil), event.Audio...)
+	event.Raw = append(json.RawMessage(nil), event.Raw...)
 	event.Metadata = cloneAnyMap(event.Metadata)
+	event.Media = cloneRealtimeMedia(event.Media)
+	if event.Conversation != nil {
+		conversation := *event.Conversation
+		conversation.Messages = cloneRealtimeMessages(conversation.Messages)
+		event.Conversation = &conversation
+	}
+	if event.Update != nil {
+		update := *event.Update
+		if update.System != nil {
+			system := *update.System
+			update.System = &system
+		}
+		update.Tools = cloneToolDefinitions(update.Tools)
+		update.ProviderOptions = cloneAnyMap(update.ProviderOptions)
+		event.Update = &update
+	}
 	if event.Cursor != nil {
 		cursor := *event.Cursor
 		event.Cursor = &cursor
@@ -598,6 +717,14 @@ func cloneRealtimeClientEvent(event provider.RealtimeClientEvent) provider.Realt
 	if event.ToolResult != nil {
 		result := *event.ToolResult
 		result.Output = append(json.RawMessage(nil), result.Output...)
+		if result.Media != nil {
+			media := make([]provider.RealtimeMedia, len(result.Media))
+			for i := range result.Media {
+				media[i] = *cloneRealtimeMedia(&result.Media[i])
+			}
+			result.Media = media
+		}
+		result.ProviderOptions = cloneAnyMap(result.ProviderOptions)
 		event.ToolResult = &result
 	}
 	return event
@@ -605,6 +732,14 @@ func cloneRealtimeClientEvent(event provider.RealtimeClientEvent) provider.Realt
 
 func cloneRealtimeEvent(event provider.RealtimeEvent) provider.RealtimeEvent {
 	event.Audio = append([]byte(nil), event.Audio...)
+	event.Raw = append(json.RawMessage(nil), event.Raw...)
+	event.Media = cloneRealtimeMedia(event.Media)
+	if event.Sources != nil {
+		event.Sources = append([]provider.Source(nil), event.Sources...)
+		for i := range event.Sources {
+			event.Sources[i].ProviderMetadata = cloneAnyMap(event.Sources[i].ProviderMetadata)
+		}
+	}
 	event.RateLimits = append([]provider.RealtimeRateLimit(nil), event.RateLimits...)
 	event.ProviderMetadata = cloneAnyMap(event.ProviderMetadata)
 	if event.Delegation != nil {
@@ -617,6 +752,55 @@ func cloneRealtimeEvent(event provider.RealtimeEvent) provider.RealtimeEvent {
 		event.ToolCall = &call
 	}
 	return event
+}
+
+// cloneToolDefinitions keeps nil and empty distinct: an empty slice in a
+// session update removes every tool.
+func cloneToolDefinitions(defs []provider.ToolDefinition) []provider.ToolDefinition {
+	if defs == nil {
+		return nil
+	}
+	out := make([]provider.ToolDefinition, len(defs))
+	copy(out, defs)
+	for i := range out {
+		out[i].InputSchema = append(json.RawMessage(nil), out[i].InputSchema...)
+		out[i].ProviderDefinedOptions = cloneAnyMap(out[i].ProviderDefinedOptions)
+	}
+	return out
+}
+
+func cloneRealtimeMedia(media *provider.RealtimeMedia) *provider.RealtimeMedia {
+	if media == nil {
+		return nil
+	}
+	out := *media
+	out.Data = append([]byte(nil), media.Data...)
+	return &out
+}
+
+func cloneRealtimeMessages(messages []provider.Message) []provider.Message {
+	if messages == nil {
+		return nil
+	}
+	out := make([]provider.Message, len(messages))
+	for i, msg := range messages {
+		out[i] = msg
+		out[i].ProviderOptions = cloneAnyMap(msg.ProviderOptions)
+		if msg.Content != nil {
+			out[i].Content = make([]provider.Part, len(msg.Content))
+			for j, part := range msg.Content {
+				part.ToolInput = append(json.RawMessage(nil), part.ToolInput...)
+				part.ProviderOptions = cloneAnyMap(part.ProviderOptions)
+				if part.RemoteRef != nil {
+					ref := *part.RemoteRef
+					ref.Data = append([]byte(nil), ref.Data...)
+					part.RemoteRef = &ref
+				}
+				out[i].Content[j] = part
+			}
+		}
+	}
+	return out
 }
 
 func cloneAnyMap(input map[string]any) map[string]any {

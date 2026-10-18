@@ -116,6 +116,7 @@ func (m *liveModel) RealtimeCapabilities() provider.RealtimeCapabilities {
 		SessionResumption:    true,
 		ContextCompression:   true,
 		UsageUpdates:         true,
+		RawEvents:            true,
 		SupportedInputAudio:  []provider.AudioFormat{liveInputFormat},
 		SupportedOutputAudio: []provider.AudioFormat{liveOutputFormat},
 	}
@@ -176,6 +177,7 @@ func (m *liveModel) OpenRealtime(ctx context.Context, params provider.RealtimePa
 		calls:          make(map[string]string),
 		scheduling:     scheduling,
 		clientActivity: params.TurnDetection.Mode == provider.TurnModeClientVAD,
+		rawEvents:      params.IncludeRawEvents,
 	}
 	if err := c.write(ctx, liveClientMessage{Setup: setup}); err != nil {
 		c.abort()
@@ -185,7 +187,7 @@ func (m *liveModel) OpenRealtime(ctx context.Context, params provider.RealtimePa
 		c.abort()
 		return nil, err
 	}
-	c.events <- provider.RealtimeEvent{Type: provider.RealtimeSessionReady}
+	c.pending = append(c.pending, provider.RealtimeEvent{Type: provider.RealtimeSessionReady})
 	go c.readLoop()
 	return c, nil
 }
@@ -462,8 +464,11 @@ type liveConn struct {
 	calls          map[string]string
 	scheduling     map[string]string
 	clientActivity bool
+	rawEvents      bool
 
-	// Reader-goroutine state for the current model turn.
+	// Reader-goroutine state. pending holds events produced during setup,
+	// delivered before anything the reader reads.
+	pending       []provider.RealtimeEvent
 	seq           int64
 	responding    bool
 	interrupted   bool
@@ -508,11 +513,22 @@ func (c *liveConn) Send(ctx context.Context, event provider.RealtimeClientEvent)
 	if c.ctx.Err() != nil {
 		return provider.ErrRealtimeSessionClosed
 	}
-	msg, err := c.encode(event)
-	if err != nil {
-		return err
+	var data []byte
+	if event.Type == provider.RealtimeRawEvent {
+		if !realtimews.IsJSONObject(event.Raw) {
+			return fmt.Errorf("%w: raw event must be a JSON object", provider.ErrInvalidRealtimeConfig)
+		}
+		data = event.Raw
+	} else {
+		msg, err := c.encode(event)
+		if err != nil {
+			return err
+		}
+		if data, err = json.Marshal(msg); err != nil {
+			return err
+		}
 	}
-	if err := c.write(ctx, msg); err != nil {
+	if err := c.ws.Write(ctx, realtimews.MessageText, data); err != nil {
 		if c.ctx.Err() != nil {
 			return provider.ErrRealtimeSessionClosed
 		}
@@ -609,6 +625,7 @@ func (c *liveConn) awaitSetup(ctx context.Context) error {
 		if msg.Error != nil {
 			return msg.Error.err()
 		}
+		c.pending = append(c.pending, c.translateMessage(data, msg)...)
 		if msg.SetupComplete != nil {
 			return nil
 		}
@@ -618,6 +635,10 @@ func (c *liveConn) awaitSetup(ctx context.Context) error {
 func (c *liveConn) readLoop() {
 	defer close(c.done)
 	defer close(c.events)
+	if !c.emit(c.pending) {
+		return
+	}
+	c.pending = nil
 	for {
 		_, data, err := c.ws.Read(c.ctx)
 		if err != nil {
@@ -632,17 +653,76 @@ func (c *liveConn) readLoop() {
 			_ = c.ws.CloseNow()
 			return
 		}
-		for _, event := range c.translate(msg) {
-			c.seq++
-			event.Sequence = c.seq
-			select {
-			case c.events <- event:
-			case <-c.closing:
-			case <-c.ctx.Done():
-				return
-			}
+		if !c.emit(c.translateMessage(data, msg)) {
+			return
 		}
 	}
+}
+
+// emit delivers events in order and reports false once the connection ends.
+// After Close they are dropped so the reader can finish the close handshake.
+func (c *liveConn) emit(events []provider.RealtimeEvent) bool {
+	for _, event := range events {
+		c.seq++
+		event.Sequence = c.seq
+		select {
+		case c.events <- event:
+		case <-c.closing:
+		case <-c.ctx.Done():
+			return false
+		}
+	}
+	return true
+}
+
+// translateMessage adds the raw message to its normalized events: always with
+// IncludeRawEvents, otherwise only when part of it has no mapping.
+func (c *liveConn) translateMessage(data []byte, msg liveServerMessage) []provider.RealtimeEvent {
+	events, unmapped := c.translate(msg)
+	if !c.rawEvents && !unmapped && !liveHasUnknownFields(data) {
+		return events
+	}
+	raw := provider.RealtimeEvent{Type: provider.RealtimeProviderEvent, Raw: append(json.RawMessage(nil), data...)}
+	return append([]provider.RealtimeEvent{raw}, events...)
+}
+
+// Fields the adapter maps. Each top-level message and serverContent field is a
+// feature of the API, so a field outside these sets is one goai does not know.
+var (
+	liveMessageFields = map[string]bool{
+		"setupComplete": true, "serverContent": true, "toolCall": true, "toolCallCancellation": true,
+		"goAway": true, "sessionResumptionUpdate": true, "usageMetadata": true, "voiceActivity": true, "error": true,
+	}
+	liveServerContentFields = map[string]bool{
+		"modelTurn": true, "turnComplete": true, "generationComplete": true, "interrupted": true,
+		"inputTranscription": true, "outputTranscription": true,
+	}
+)
+
+func liveHasUnknownFields(data []byte) bool {
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(data, &fields) != nil {
+		return true
+	}
+	for key := range fields {
+		if !liveMessageFields[key] {
+			return true
+		}
+	}
+	content, ok := fields["serverContent"]
+	if !ok {
+		return false
+	}
+	var contentFields map[string]json.RawMessage
+	if json.Unmarshal(content, &contentFields) != nil {
+		return true
+	}
+	for key := range contentFields {
+		if !liveServerContentFields[key] {
+			return true
+		}
+	}
+	return false
 }
 
 // liveCloseError turns the server's close frame into the terminal error; Live
@@ -673,10 +753,10 @@ func (c *liveConn) setErr(err error) {
 	c.errMu.Unlock()
 }
 
-// translate maps one server message to common events. It runs only on the
-// reader goroutine, which owns the turn state.
-func (c *liveConn) translate(msg liveServerMessage) []provider.RealtimeEvent {
-	var events []provider.RealtimeEvent
+// translate maps one server message to common events and reports whether part
+// of it has no mapping. It runs only on the goroutine that owns the turn state:
+// the opener during setup, then the reader.
+func (c *liveConn) translate(msg liveServerMessage) (events []provider.RealtimeEvent, unmapped bool) {
 	startResponse := func() {
 		if !c.responding {
 			c.responding = true
@@ -694,6 +774,8 @@ func (c *liveConn) translate(msg liveServerMessage) []provider.RealtimeEvent {
 			events = append(events, provider.RealtimeEvent{Type: provider.RealtimeInputSpeechStarted})
 		case "ACTIVITY_END":
 			events = append(events, provider.RealtimeEvent{Type: provider.RealtimeInputSpeechStopped})
+		default:
+			unmapped = true
 		}
 	}
 
@@ -706,7 +788,10 @@ func (c *liveConn) translate(msg liveServerMessage) []provider.RealtimeEvent {
 			for _, part := range turn.Parts {
 				switch {
 				case part.Thought:
-					// Interleaved reasoning is internal to the model; it is not output.
+					if part.Text != "" {
+						startResponse()
+						events = append(events, provider.RealtimeEvent{Type: provider.RealtimeReasoningDelta, Text: part.Text})
+					}
 				case part.InlineData != nil && strings.HasPrefix(part.InlineData.MimeType, "audio/"):
 					startResponse()
 					c.turnHadOutput = true
@@ -719,6 +804,10 @@ func (c *liveConn) translate(msg liveServerMessage) []provider.RealtimeEvent {
 					startResponse()
 					c.turnHadOutput = true
 					events = append(events, provider.RealtimeEvent{Type: provider.RealtimeTextDelta, Text: part.Text})
+				default:
+					startResponse()
+					c.turnHadOutput = true
+					unmapped = true
 				}
 			}
 		}
@@ -729,6 +818,9 @@ func (c *liveConn) translate(msg liveServerMessage) []provider.RealtimeEvent {
 		}
 		if sc.Interrupted {
 			c.interrupted = true
+		}
+		if sc.GenerationComplete {
+			events = append(events, provider.RealtimeEvent{Type: provider.RealtimeGenerationComplete})
 		}
 		if sc.TurnComplete {
 			events = append(events, c.finishTurn()...)
@@ -782,7 +874,7 @@ func (c *liveConn) translate(msg liveServerMessage) []provider.RealtimeEvent {
 		}
 		events = append(events, provider.RealtimeEvent{Type: provider.RealtimeUsageUpdated, Usage: usage})
 	}
-	return events
+	return events, unmapped
 }
 
 // finishTurn closes the current model turn: final transcripts, then the
