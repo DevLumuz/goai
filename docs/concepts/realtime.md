@@ -13,6 +13,8 @@ A realtime session is a long-lived, bidirectional connection to a voice model. A
 | --- | --- | --- |
 | Gemini Live | `google.Live("gemini-3.8-live")` | Gemini API |
 | Gemini Live | `google.Live(id, google.WithVertex(project, location))` or `vertex.Live(id)` | Vertex AI |
+| OpenAI Realtime | `openai.Realtime("gpt-realtime-2.1")` | OpenAI |
+| OpenAI Realtime | `azure.Realtime(deployment)` | Azure OpenAI |
 
 Sessions connect from your Go process to the provider over WebSocket. Capturing and playing audio, and how your own clients reach your backend, are up to your application.
 
@@ -72,7 +74,7 @@ caps := provider.RealtimeCapabilitiesOf(model)
 fmt.Println(caps.SupportedInputAudio, caps.SupportedOutputAudio)
 ```
 
-Gemini Live takes 16 kHz mono PCM16 and returns 24 kHz mono PCM16. Each `RealtimeOutputAudio` event carries its `AudioFormat`, so playback never has to guess the sample rate.
+Gemini Live takes 16 kHz mono PCM16 and returns 24 kHz mono PCM16. OpenAI Realtime uses 24 kHz mono PCM16, or 8 kHz G.711 for telephony. Each `RealtimeOutputAudio` event carries its `AudioFormat`, so playback never has to guess the sample rate.
 
 ## Turns and Interruptions
 
@@ -113,7 +115,7 @@ session, err := goai.OpenRealtimeSession(ctx, model,
 - Results are sent as JSON. Text that is not JSON is wrapped as `{"text": "..."}`; errors as `{"error": "..."}`. Keep secrets and internal details out of both.
 - The model decides which tool to call. Authorization and human confirmation belong in `WithRealtimeOnBeforeToolExecute`.
 
-Gemini 3.8 Live runs functions without blocking the conversation by default. Choose per tool with `google.LiveToolOptions`:
+With OpenAI Realtime the model waits for the tool outputs of a response; GoAI continues the conversation once all of them are sent. Gemini 3.8 Live runs functions without blocking the conversation by default. Choose per tool with `google.LiveToolOptions`:
 
 ```go
 tool.ProviderDefinedOptions = google.LiveToolOptions(google.LiveBlocking, "")       // wait for the result

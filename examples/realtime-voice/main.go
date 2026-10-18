@@ -2,16 +2,17 @@
 
 // Example: realtime voice session with tool calling.
 //
-// Opens a Gemini Live session, sends either a text prompt or a recorded audio
+// Opens a realtime session, sends either a text prompt or a recorded audio
 // file, writes the spoken reply to a raw PCM file, and prints transcripts. The
 // model can call a local tool; the session runtime executes it and returns the
-// result automatically.
+// result automatically. The same code runs on every backend.
 //
-// Audio is raw PCM16 mono: 16 kHz in, 24 kHz out. To hear the reply:
+// Audio is raw PCM16 mono. Input is 16 kHz for Gemini and 24 kHz for OpenAI;
+// the reply is 24 kHz on both. To hear it:
 //
 //	ffplay -f s16le -ar 24000 -ac 1 reply.pcm
 //
-// To record a prompt:
+// To record a prompt (use -ar 24000 for openai and azure):
 //
 //	ffmpeg -i question.wav -f s16le -ar 16000 -ac 1 question.pcm
 //
@@ -21,10 +22,11 @@
 //	go run ./examples/realtime-voice/main.go -text "What time is it in Tokyo?"
 //	go run ./examples/realtime-voice/main.go -in question.pcm
 //
-// On Vertex AI (Application Default Credentials):
+// Other backends:
 //
-//	export GOOGLE_CLOUD_PROJECT=my-project
-//	go run ./examples/realtime-voice/main.go -backend vertex -text "Hello"
+//	GOOGLE_CLOUD_PROJECT=my-project go run ./examples/realtime-voice/main.go -backend vertex -text "Hello"
+//	OPENAI_API_KEY=... go run ./examples/realtime-voice/main.go -backend openai -model gpt-realtime-2.1 -text "Hello"
+//	AZURE_OPENAI_ENDPOINT=... AZURE_OPENAI_API_KEY=... go run ./examples/realtime-voice/main.go -backend azure -model my-deployment -text "Hello"
 package main
 
 import (
@@ -38,15 +40,17 @@ import (
 
 	"github.com/zendev-sh/goai"
 	"github.com/zendev-sh/goai/provider"
+	"github.com/zendev-sh/goai/provider/azure"
 	"github.com/zendev-sh/goai/provider/google"
+	"github.com/zendev-sh/goai/provider/openai"
 	"github.com/zendev-sh/goai/provider/vertex"
 )
 
 func main() {
-	backend := flag.String("backend", "gemini", "gemini (AI Studio) or vertex")
-	modelID := flag.String("model", "gemini-3.8-live", "Live model ID")
+	backend := flag.String("backend", "gemini", "gemini (AI Studio), vertex, openai, or azure")
+	modelID := flag.String("model", "gemini-3.8-live", "model ID, or deployment name on azure")
 	text := flag.String("text", "", "text prompt to send")
-	in := flag.String("in", "", "16 kHz mono PCM16 file to send as speech")
+	in := flag.String("in", "", "mono PCM16 file to send as speech (16 kHz gemini/vertex, 24 kHz openai/azure)")
 	out := flag.String("out", "reply.pcm", "file for the 24 kHz mono PCM16 reply")
 	flag.Parse()
 	if (*text == "") == (*in == "") {
@@ -59,9 +63,14 @@ func main() {
 		model = google.Live(*modelID) // reads GEMINI_API_KEY
 	case "vertex":
 		model = vertex.Live(*modelID) // reads GOOGLE_CLOUD_PROJECT and ADC
+	case "openai":
+		model = openai.Realtime(*modelID) // reads OPENAI_API_KEY
+	case "azure":
+		model = azure.Realtime(*modelID) // reads AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY
 	default:
 		log.Fatalf("unknown backend %q", *backend)
 	}
+	inputRate := provider.RealtimeCapabilitiesOf(model).SupportedInputAudio[0].SampleRate
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -89,7 +98,7 @@ func main() {
 		if *text != "" {
 			err = session.SendText(ctx, *text)
 		} else {
-			err = streamFile(ctx, session, *in)
+			err = streamFile(ctx, session, *in, inputRate)
 		}
 		if err != nil {
 			log.Printf("send: %v", err)
@@ -121,14 +130,14 @@ func main() {
 	}
 }
 
-// streamFile sends a PCM file in 100 ms frames at real-time pace, then a second
-// of silence so the provider's voice activity detection ends the turn.
-func streamFile(ctx context.Context, session *goai.RealtimeSession, path string) error {
+// streamFile sends a PCM16 file in 100 ms frames at real-time pace, then a
+// second of silence so the provider's voice activity detection ends the turn.
+func streamFile(ctx context.Context, session *goai.RealtimeSession, path string, rate int) error {
 	audio, err := os.ReadFile(path)
 	if err != nil {
 		return err
 	}
-	const frame = 16_000 * 2 / 10 // 100 ms of 16 kHz PCM16
+	frame := rate * 2 / 10 // 100 ms of PCM16
 	audio = append(audio, make([]byte, 10*frame)...)
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()

@@ -153,6 +153,27 @@ model := openai.Image("gpt-image-2",
 )
 ```
 
+### Realtime Voice
+
+`Realtime` opens a [realtime session](../concepts/realtime.md) with the GA Realtime API over WebSocket (`wss://api.openai.com/v1/realtime?model=...`). Use `gpt-realtime-2.1` or `gpt-realtime-2.1-mini`; `gpt-realtime` and `gpt-realtime-mini` shut down on January 20, 2027. Experimental.
+
+```go
+model := openai.Realtime("gpt-realtime-2.1", openai.WithAPIKey(apiKey))
+session, err := goai.OpenRealtimeSession(ctx, model,
+    goai.WithRealtimeVoice("marin"),
+    goai.WithRealtimeTools(weatherTool),
+    goai.WithRealtimeInputTranscription(provider.TranscriptionConfig{Enabled: true}),
+    goai.WithRealtimeOutputTranscription(provider.TranscriptionConfig{Enabled: true}),
+)
+```
+
+- **Audio:** 24 kHz mono PCM16, or 8 kHz G.711 (`AudioG711U`, `AudioG711A`), chosen per direction.
+- **Turns:** server voice activity detection by default; set `ProviderOptions: {"type": "semantic_vad"}` on `TurnDetection` for semantic detection. `TurnModeManual` sends `turn_detection: null`: call `CommitInput` and `RequestResponse` yourself. Client activity signals are not part of this API.
+- **Responses:** like the official Agents SDK, `response.create` is never sent while a response is in progress; requests made meanwhile (text input, `RequestResponse`, tool continuations) coalesce into one, sent when the active response finishes. After tool calls, all outputs are sent before the model continues.
+- **Interruptions:** `Interrupt` cancels the active response and, with a `PlaybackCursor`, truncates the item to the played audio, clamped to the audio received for that item.
+- **Transcription:** input transcription defaults to `gpt-live-transcribe`; pick another model with `TranscriptionConfig.ProviderOptions["model"]`.
+- **Session fields:** other fields go in `ProviderOptions` with their Realtime API names and merge into the session, for example `{"reasoning": {"effort": "low"}}`, `{"truncation": {...}}`, or `{"audio": {"output": {"speed": 1.1}}}`.
+
 ## API Routing
 
 All models use the Responses API (`/v1/responses`) by default. To force Chat Completions:

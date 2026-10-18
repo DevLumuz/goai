@@ -159,6 +159,20 @@ model := azure.Chat("gpt-4o",
 
 When using `WithTokenSource`, the provider sends `Authorization: Bearer {token}` instead of `api-key`.
 
+### Realtime Voice
+
+`Realtime` opens a [realtime session](../concepts/realtime.md) against a `gpt-realtime-2.1` or `gpt-realtime-2.1-mini` deployment through the GA endpoint `wss://{resource}.openai.azure.com/openai/v1/realtime?model={deployment}`. Experimental.
+
+```go
+model := azure.Realtime("my-realtime-deployment",
+    azure.WithEndpoint("https://your-resource.openai.azure.com"),
+    azure.WithAPIKey(apiKey), // or WithTokenSource for Microsoft Entra ID
+)
+session, err := goai.OpenRealtimeSession(ctx, model, goai.WithRealtimeTools(weatherTool))
+```
+
+The protocol and options are the same as [`openai.Realtime`](openai.md#realtime-voice). Authentication uses the `api-key` header, or `Authorization: Bearer` with a token source issued for the `https://cognitiveservices.azure.com/.default` scope. Azure does not support the `truncation` session field for GPT Realtime 2.x; use `Interrupt` with a `PlaybackCursor` to trim the conversation instead. The input transcription model must be one your resource deploys.
+
 ## Options
 
 | Option                       | Type                   | Description                                                                                           |
