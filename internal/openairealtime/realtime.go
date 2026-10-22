@@ -159,6 +159,12 @@ func (m *model) OpenRealtime(ctx context.Context, params provider.RealtimeParams
 }
 
 func realtimeURL(base, modelID string) (string, error) {
+	return endpointURL(base, "/realtime", modelID)
+}
+
+// endpointURL turns an HTTP(S) API base into the WebSocket URL of path with
+// the model as a query parameter.
+func endpointURL(base, path, modelID string) (string, error) {
 	u, err := url.Parse(strings.TrimRight(base, "/"))
 	if err != nil {
 		return "", fmt.Errorf("invalid realtime base URL: %w", err)
@@ -171,7 +177,7 @@ func realtimeURL(base, modelID string) (string, error) {
 	default:
 		return "", fmt.Errorf("unsupported realtime base URL scheme %q", u.Scheme)
 	}
-	u.Path += "/realtime"
+	u.Path += path
 	q := u.Query()
 	q.Set("model", modelID)
 	u.RawQuery = q.Encode()

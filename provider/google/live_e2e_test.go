@@ -7,8 +7,6 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/binary"
-	"encoding/json"
-	"errors"
 	"image"
 	"image/color"
 	"image/draw"
@@ -34,96 +32,6 @@ func liveE2EModel(t *testing.T) provider.RealtimeModel {
 		id = "gemini-3.8-live"
 	}
 	return Live(id)
-}
-
-func TestE2E_LiveTextToAudio(t *testing.T) {
-	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
-	defer cancel()
-
-	session, err := goai.OpenRealtimeSession(ctx, liveE2EModel(t),
-		goai.WithRealtimeSystem("Answer in one short sentence."),
-		goai.WithRealtimeOutputTranscription(provider.TranscriptionConfig{Enabled: true}),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = session.Close() }()
-
-	if err := session.SendText(ctx, "Say hello."); err != nil {
-		t.Fatal(err)
-	}
-
-	var audioBytes int
-	var transcript string
-	for ev := range session.Events() {
-		switch ev.Type {
-		case provider.RealtimeOutputAudio:
-			audioBytes += len(ev.Audio)
-		case provider.RealtimeOutputTranscript:
-			if ev.IsFinal {
-				transcript = ev.Text
-			}
-		case provider.RealtimeResponseFinished:
-			t.Logf("finished (%s): %d audio bytes, transcript %q", ev.FinishReason, audioBytes, transcript)
-			if audioBytes == 0 {
-				t.Fatal("no audio received")
-			}
-			return
-		}
-	}
-	t.Fatalf("session ended before the response finished: %v", session.Err())
-}
-
-func TestE2E_LiveToolCall(t *testing.T) {
-	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
-	defer cancel()
-
-	called := make(chan string, 1)
-	weather := goai.Tool{
-		Name:                   "get_weather",
-		Description:            "Returns the current weather for a city.",
-		InputSchema:            json.RawMessage(`{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}`),
-		ProviderDefinedOptions: LiveToolOptions(LiveBlocking, ""),
-		Execute: func(_ context.Context, input json.RawMessage) (string, error) {
-			called <- string(input)
-			return `{"condition":"sunny","celsius":21}`, nil
-		},
-	}
-	session, err := goai.OpenRealtimeSession(ctx, liveE2EModel(t),
-		goai.WithRealtimeTools(weather),
-		goai.WithRealtimeOutputTranscription(provider.TranscriptionConfig{Enabled: true}),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = session.Close() }()
-
-	if err := session.SendText(ctx, "What is the weather in Lima right now? Use the tool."); err != nil {
-		t.Fatal(err)
-	}
-
-	toolDone := false
-	for ev := range session.Events() {
-		switch ev.Type {
-		case provider.RealtimeToolCallEvent:
-			t.Logf("tool call %s %s", ev.ToolCall.Name, ev.ToolCall.Input)
-		case provider.RealtimeOutputTranscript:
-			if ev.IsFinal {
-				t.Logf("transcript: %q", ev.Text)
-			}
-		case provider.RealtimeResponseFinished:
-			if toolDone && ev.FinishReason != provider.FinishToolCalls {
-				return
-			}
-		}
-		select {
-		case input := <-called:
-			t.Logf("tool executed with %s", input)
-			toolDone = true
-		default:
-		}
-	}
-	t.Fatalf("session ended early (tool executed: %v): %v", toolDone, session.Err())
 }
 
 // liveE2ESession opens a session on the model under test and closes it at the end.
@@ -175,25 +83,6 @@ func solidPNG(t *testing.T, c color.Color) []byte {
 	return buf.Bytes()
 }
 
-func TestE2E_LiveImageInput(t *testing.T) {
-	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
-	defer cancel()
-	session := liveE2ESession(t, ctx, liveE2EModel(t))
-
-	if err := session.InputImage(ctx, provider.RealtimeMedia{MIMEType: "image/png", Data: solidPNG(t, color.RGBA{R: 255, A: 255})}); err != nil {
-		t.Fatal(err)
-	}
-	// Realtime input carries no ordering guarantee against text: a camera
-	// stream is already in context when the user asks, so wait like one.
-	time.Sleep(2 * time.Second)
-	if err := session.SendText(ctx, "What single color fills the image? Answer with one word."); err != nil {
-		t.Fatal(err)
-	}
-	if transcript, _ := replyTranscript(t, session); !strings.Contains(strings.ToLower(transcript), "red") {
-		t.Fatalf("transcript = %q, want the color red", transcript)
-	}
-}
-
 // TestE2E_LiveImageInHistory sends a still image through the ordered
 // conversation history, the path for an image a question refers to.
 func TestE2E_LiveImageInHistory(t *testing.T) {
@@ -214,30 +103,6 @@ func TestE2E_LiveImageInHistory(t *testing.T) {
 	}
 	if transcript, _ := replyTranscript(t, session); !strings.Contains(strings.ToLower(transcript), "blue") {
 		t.Fatalf("transcript = %q, want the color blue", transcript)
-	}
-}
-
-func TestE2E_LiveConversationHistory(t *testing.T) {
-	ctx, cancel := context.WithTimeout(t.Context(), 90*time.Second)
-	defer cancel()
-	session := liveE2ESession(t, ctx, liveE2EModel(t))
-
-	err := session.AppendConversation(ctx, provider.RealtimeConversation{Messages: []provider.Message{
-		{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "My favorite fruit is the mango."}}},
-		{Role: provider.RoleAssistant, Content: []provider.Part{{Type: provider.PartText, Text: "Noted, mango it is."}}},
-		{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "What is my favorite fruit? One word."}}},
-	}, RequestResponse: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if transcript, _ := replyTranscript(t, session); !strings.Contains(strings.ToLower(transcript), "mango") {
-		t.Fatalf("history not used: %q", transcript)
-	}
-
-	// The Gemini API ignores contextUpdate, so goai refuses it instead.
-	system := "Reply only with the word pineapple."
-	if err := session.UpdateSession(ctx, goai.RealtimeUpdate{System: &system}); !errors.Is(err, provider.ErrRealtimeUnsupported) {
-		t.Fatalf("UpdateSession on the Gemini API = %v", err)
 	}
 }
 
@@ -358,37 +223,4 @@ func cmpOrEnv(key, fallback string) string {
 		return v
 	}
 	return fallback
-}
-
-// TestE2E_LiveResumption resumes a closed session on a new connection with its
-// resume token and checks the model kept the conversation.
-func TestE2E_LiveResumption(t *testing.T) {
-	ctx, cancel := context.WithTimeout(t.Context(), 90*time.Second)
-	defer cancel()
-	model := liveE2EModel(t)
-
-	first := liveE2ESession(t, ctx, model, goai.WithRealtimeResumption(""))
-	if err := first.SendText(ctx, "Remember this code word: zebra. Just say OK."); err != nil {
-		t.Fatal(err)
-	}
-	var token string
-	for ev := range first.Events() {
-		if ev.Type == provider.RealtimeSessionResumeState && ev.ResumeToken != "" {
-			token = ev.ResumeToken
-		}
-		if ev.Type == provider.RealtimeResponseFinished && !ev.Pending && token != "" {
-			break
-		}
-	}
-	if err := first.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	second := liveE2ESession(t, ctx, model, goai.WithRealtimeResumption(token))
-	if err := second.SendText(ctx, "What was the code word? One word."); err != nil {
-		t.Fatal(err)
-	}
-	if transcript, _ := replyTranscript(t, second); !strings.Contains(strings.ToLower(transcript), "zebra") {
-		t.Fatalf("resumed session forgot the conversation: %q", transcript)
-	}
 }

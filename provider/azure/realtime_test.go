@@ -94,3 +94,47 @@ func TestRealtime_ConfigurationErrors(t *testing.T) {
 		t.Fatal("env-configured model must keep its deployment name")
 	}
 }
+
+func TestTranslation_Endpoint(t *testing.T) {
+	ignore := goleak.IgnoreCurrent()
+	t.Cleanup(func() { goleak.VerifyNone(t, ignore) })
+
+	got := make(chan realtimeHandshake, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.CloseNow() }()
+		got <- realtimeHandshake{r.URL.Path, r.URL.RawQuery, r.Header.Get("Authorization"), r.Header.Get("api-key")}
+		ctx := r.Context()
+		_ = conn.Write(ctx, websocket.MessageText, []byte(`{"type":"session.created","session":{"id":"s"}}`))
+		for {
+			_, data, err := conn.Read(ctx)
+			if err != nil {
+				return
+			}
+			if string(data) == `{"type":"session.close"}` {
+				_ = conn.Write(ctx, websocket.MessageText, []byte(`{"type":"session.closed"}`))
+				return
+			}
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	model := Translation("my-translate", WithEndpoint(server.URL), WithAPIKey("az-key"))
+	if model.ModelID() != "my-translate" {
+		t.Fatalf("ModelID = %q", model.ModelID())
+	}
+	conn, err := model.OpenRealtime(t.Context(), provider.RealtimeParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := <-got
+	if h.path != "/openai/v1/realtime/translations" || h.query != "model=my-translate" || h.apiKey != "az-key" {
+		t.Errorf("handshake = %+v", h)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+}

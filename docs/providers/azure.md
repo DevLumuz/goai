@@ -173,6 +173,8 @@ session, err := goai.OpenRealtimeSession(ctx, model, goai.WithRealtimeTools(weat
 
 The protocol and options are the same as [`openai.Realtime`](openai.md#realtime-voice). Authentication uses the `api-key` header, or `Authorization: Bearer` with a token source issued for the `https://cognitiveservices.azure.com/.default` scope. Azure does not support the `truncation` session field for GPT Realtime 2.x; use `Interrupt` with a `PlaybackCursor` to trim the conversation instead. The input transcription model must be one your resource deploys. Provider metadata on events is under the `"azure"` key.
 
+`Translation` opens a realtime translation session against a `gpt-realtime-translate` deployment at `wss://{resource}.openai.azure.com/openai/v1/realtime/translations?model={deployment}`, with the same authentication and the protocol of [`openai.Translation`](openai.md#realtime-translation). Experimental.
+
 ## Options
 
 | Option                       | Type                   | Description                                                                                           |

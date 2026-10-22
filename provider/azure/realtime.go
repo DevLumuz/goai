@@ -19,6 +19,22 @@ import (
 //
 // Experimental: see provider.RealtimeModel.
 func Realtime(deployment string, opts ...Option) provider.RealtimeModel {
+	return openairealtime.New(realtimeConfig(deployment, opts))
+}
+
+// Translation creates an Azure OpenAI realtime translation model for a
+// deployment of gpt-realtime-translate, at
+// wss://{resource}.openai.azure.com/openai/v1/realtime/translations. The
+// protocol and options match openai.Translation.
+//
+// Experimental: see provider.RealtimeModel.
+func Translation(deployment string, opts ...Option) provider.RealtimeModel {
+	return openairealtime.NewTranslation(realtimeConfig(deployment, opts))
+}
+
+// realtimeConfig resolves the endpoint and credentials shared by the
+// WebSocket models.
+func realtimeConfig(deployment string, opts []Option) openairealtime.Config {
 	o := options{}
 	for _, opt := range opts {
 		opt(&o)
@@ -26,7 +42,7 @@ func Realtime(deployment string, opts ...Option) provider.RealtimeModel {
 	resolveOptions(&o)
 
 	apiKey, ts := o.apiKey, o.tokenSource
-	return openairealtime.New(openairealtime.Config{
+	return openairealtime.Config{
 		Provider:   "azure",
 		ModelID:    deployment,
 		BaseURL:    strings.TrimRight(o.endpoint, "/") + "/openai/v1",
@@ -50,5 +66,5 @@ func Realtime(deployment string, opts ...Option) provider.RealtimeModel {
 			header.Set("api-key", apiKey)
 			return nil
 		},
-	})
+	}
 }

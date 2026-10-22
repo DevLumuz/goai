@@ -17,6 +17,7 @@ A realtime session is a long-lived, bidirectional connection to a voice model. A
 | OpenAI Realtime | `azure.Realtime(deployment)` | Azure OpenAI |
 | OpenAI GPT-Live | `openai.Live("gpt-live-1")`, `openai.LiveFork(id)`, `openai.LiveSideband(id)` | OpenAI (delegates to a backend; see [Delegation](#delegation)) |
 | OpenAI Realtime Translation | `openai.Translation("gpt-realtime-translate")` | OpenAI (speech in, translated speech out) |
+| OpenAI Realtime Translation | `azure.Translation(deployment)` | Azure OpenAI |
 
 Sessions connect from your Go process to the provider over WebSocket. Capturing and playing audio, and how your own clients reach your backend, are up to your application.
 
