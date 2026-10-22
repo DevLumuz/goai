@@ -169,10 +169,16 @@ session, err := goai.OpenRealtimeSession(ctx, model,
 
 - **Audio:** 24 kHz mono PCM16, or 8 kHz G.711 (`AudioG711U`, `AudioG711A`), chosen per direction.
 - **Turns:** server voice activity detection by default; set `ProviderOptions: {"type": "semantic_vad"}` on `TurnDetection` for semantic detection. `TurnModeManual` sends `turn_detection: null`: call `CommitInput` and `RequestResponse` yourself. Client activity signals are not part of this API.
-- **Responses:** like the official Agents SDK, `response.create` is never sent while a response is in progress; requests made meanwhile (text input, `RequestResponse`, tool continuations) coalesce into one, sent when the active response finishes. After tool calls, all outputs are sent before the model continues.
+- **Responses:** like the official Agents SDK, `response.create` is never sent while a response is in progress. Automatic requests made meanwhile (text input, `RequestResponse`, tool continuations) coalesce into one; requests with parameters are sent one by one, in order. A request the server rejects (for example because voice activity already started a response) is dropped, not retried. After tool calls, all outputs are sent before the model continues.
+- **Response parameters:** `RequestResponseWith(ctx, opts)` takes the parameters of one response, typed by `openai.RealtimeResponse(openai.RealtimeResponseOptions{...})`: instructions, tools, modalities, voice, metadata, a custom input context, or `OutOfBand` to keep it out of the conversation (for example, to classify what the user said while the conversation goes on). Its events carry the `ResponseID` and `metadata` in `ProviderMetadata["openai"]`.
 - **Interruptions:** `Interrupt` cancels the active response and, with a `PlaybackCursor`, truncates the item to the played audio, clamped to the audio received for that item.
 - **Transcription:** input transcription defaults to `gpt-live-transcribe`; pick another model with `TranscriptionConfig.ProviderOptions["model"]`.
-- **Session fields:** other fields go in `ProviderOptions` with their Realtime API names and merge into the session, for example `{"reasoning": {"effort": "low"}}`, `{"truncation": {...}}`, or `{"audio": {"output": {"speed": 1.1}}}`.
+- **Session settings:** `openai.RealtimeConfig` types the session fields without a common option (output modalities, custom voice ID, speed, noise reduction, server or semantic VAD with idle timeout, transcription model and hints, include, stored prompt, tracing, truncation, reasoning, parallel tool calls). Pass it with `goai.WithRealtimeProviderOptions(openai.RealtimeProviderOptions(cfg))`. Any other field goes in `ProviderOptions` with its Realtime API name and merges into the session.
+- **Images, history, and updates:** `InputImage` adds an `input_image` item; `AppendConversation` adds messages, tool calls, and tool outputs as items; `UpdateSession` sends `session.update`.
+- **MCP:** `openai.Tools.MCP(label, ...)` adds a remote MCP server or connector to the session; OpenAI calls its tools. Approval requests arrive raw (`mcp_approval_request` items); answer with `session.SendRaw(ctx, openai.RealtimeMCPApproval(id, approve, reason))`.
+- **Other commands:** `openai.RealtimeCreateItem`, `RealtimeDeleteItem`, `RealtimeRetrieveItem`, `RealtimeTruncateItem`, and `RealtimeClearInputAudio` build the client events without a common method, for `SendRaw`.
+- **Events:** speech events carry `AudioStart`/`AudioEnd`; transcripts carry logprobs and usage in `ProviderMetadata`, and diarized segments their `Speaker` and time span; `response.output_text.done` arrives as a final `RealtimeTextDelta`; usage includes the per-modality details. Item lifecycle, MCP, content-part, and WebRTC/SIP-only events arrive as `RealtimeProviderEvent`.
+- **Tool outputs** are a single text value: partial results and media return `ErrRealtimeUnsupported`. There is no audio stream end (`EndInputAudio`).
 
 ### Realtime Voice with GPT-Live
 
@@ -334,7 +340,7 @@ if errors.As(streamErr, &protocolErr) {
 
 ## Provider Tools
 
-Four built-in tools are available via `openai.Tools`. These require the Responses API.
+Five built-in tools are available via `openai.Tools`. All require the Responses API except `MCP`, which also works in Realtime sessions.
 
 | Tool | Description |
 |------|-------------|
@@ -342,6 +348,7 @@ Four built-in tools are available via `openai.Tools`. These require the Response
 | `openai.Tools.CodeInterpreter()` | Server-side Python code execution in a sandbox. |
 | `openai.Tools.FileSearch()` | Semantic/keyword search over uploaded files via vector stores. |
 | `openai.Tools.ImageGeneration()` | Generate images within a conversation using GPT Image. |
+| `openai.Tools.MCP(label, ...)` | A remote MCP server or OpenAI connector whose tools OpenAI calls, with optional approvals. |
 
 ### WebSearch
 

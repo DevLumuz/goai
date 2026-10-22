@@ -270,7 +270,9 @@ type RealtimeClientEvent struct {
 	Conversation *RealtimeConversation
 	Update       *RealtimeSessionUpdate
 	Raw          json.RawMessage
-	Metadata     map[string]any
+	// ProviderOptions are provider-specific fields the adapter merges into the
+	// message it writes, such as the parameters of a requested response.
+	ProviderOptions map[string]any
 }
 
 // RealtimeEventType identifies an event emitted by a realtime model.

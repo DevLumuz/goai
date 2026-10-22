@@ -374,6 +374,13 @@ func (s *RealtimeSession) RequestResponse(ctx context.Context) error {
 	return s.send(ctx, provider.RealtimeClientEvent{Type: provider.RealtimeResponseCreate})
 }
 
+// RequestResponseWith asks for a response with provider-specific parameters,
+// such as instructions or tools for that response only, or one kept out of the
+// conversation. Each provider documents its options.
+func (s *RealtimeSession) RequestResponseWith(ctx context.Context, providerOptions map[string]any) error {
+	return s.send(ctx, provider.RealtimeClientEvent{Type: provider.RealtimeResponseCreate, ProviderOptions: providerOptions})
+}
+
 // Interrupt cancels the active response. cursor should identify audio actually
 // played when the provider supports output truncation.
 func (s *RealtimeSession) Interrupt(ctx context.Context, cursor *provider.PlaybackCursor) error {
@@ -689,7 +696,7 @@ func cloneRealtimeParams(params provider.RealtimeParams) provider.RealtimeParams
 func cloneRealtimeClientEvent(event provider.RealtimeClientEvent) provider.RealtimeClientEvent {
 	event.Audio = append([]byte(nil), event.Audio...)
 	event.Raw = append(json.RawMessage(nil), event.Raw...)
-	event.Metadata = cloneAnyMap(event.Metadata)
+	event.ProviderOptions = cloneAnyMap(event.ProviderOptions)
 	event.Media = cloneRealtimeMedia(event.Media)
 	if event.Conversation != nil {
 		conversation := *event.Conversation

@@ -171,7 +171,7 @@ model := azure.Realtime("my-realtime-deployment",
 session, err := goai.OpenRealtimeSession(ctx, model, goai.WithRealtimeTools(weatherTool))
 ```
 
-The protocol and options are the same as [`openai.Realtime`](openai.md#realtime-voice). Authentication uses the `api-key` header, or `Authorization: Bearer` with a token source issued for the `https://cognitiveservices.azure.com/.default` scope. Azure does not support the `truncation` session field for GPT Realtime 2.x; use `Interrupt` with a `PlaybackCursor` to trim the conversation instead. The input transcription model must be one your resource deploys.
+The protocol and options are the same as [`openai.Realtime`](openai.md#realtime-voice). Authentication uses the `api-key` header, or `Authorization: Bearer` with a token source issued for the `https://cognitiveservices.azure.com/.default` scope. Azure does not support the `truncation` session field for GPT Realtime 2.x; use `Interrupt` with a `PlaybackCursor` to trim the conversation instead. The input transcription model must be one your resource deploys. Provider metadata on events is under the `"azure"` key.
 
 ## Options
 

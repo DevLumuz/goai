@@ -1,6 +1,10 @@
 package openai
 
-import "github.com/zendev-sh/goai/provider"
+import (
+	"maps"
+
+	"github.com/zendev-sh/goai/provider"
+)
 
 // Tools provides factory functions for OpenAI provider-defined tools.
 // These tools use OpenAI's built-in tool types via the Responses API.
@@ -21,11 +25,16 @@ var Tools = struct {
 	// ImageGeneration creates an image generation tool definition.
 	// Models can generate images using GPT Image within a conversation.
 	ImageGeneration func(opts ...ImageGenerationOption) provider.ToolDefinition
+
+	// MCP connects a remote MCP server or an OpenAI connector whose tools
+	// OpenAI calls itself, with optional approval requests.
+	MCP func(serverLabel string, opts ...MCPOption) provider.ToolDefinition
 }{
 	WebSearch:       webSearchTool,
 	CodeInterpreter: codeInterpreterTool,
 	FileSearch:      fileSearchTool,
 	ImageGeneration: imageGenerationTool,
+	MCP:             mcpTool,
 }
 
 // ---------------------------------------------------------------------------
@@ -418,6 +427,104 @@ func imageGenerationTool(opts ...ImageGenerationOption) provider.ToolDefinition 
 	return provider.ToolDefinition{
 		Name:                   "image_generation",
 		ProviderDefinedType:    "image_generation",
+		ProviderDefinedOptions: providerOpts,
+	}
+}
+
+// ---------------------------------------------------------------------------
+// MCP
+// ---------------------------------------------------------------------------
+
+// MCPOption configures the MCP tool.
+type MCPOption func(map[string]any)
+
+// MCPToolFilter selects MCP tools by name or by their read-only hint.
+type MCPToolFilter struct {
+	ToolNames []string
+	ReadOnly  *bool
+}
+
+func (f MCPToolFilter) wire() map[string]any {
+	filter := map[string]any{}
+	if len(f.ToolNames) > 0 {
+		filter["tool_names"] = append([]string(nil), f.ToolNames...)
+	}
+	if f.ReadOnly != nil {
+		filter["read_only"] = *f.ReadOnly
+	}
+	return filter
+}
+
+// WithMCPServerURL sets the URL of a remote MCP server.
+func WithMCPServerURL(url string) MCPOption {
+	return func(m map[string]any) { m["server_url"] = url }
+}
+
+// WithMCPConnector uses an OpenAI connector, such as "connector_gmail",
+// instead of a server URL.
+func WithMCPConnector(id string) MCPOption {
+	return func(m map[string]any) { m["connector_id"] = id }
+}
+
+// WithMCPTunnel reaches the server through an OpenAI tunnel.
+func WithMCPTunnel(id string) MCPOption {
+	return func(m map[string]any) { m["tunnel_id"] = id }
+}
+
+// WithMCPAuthorization sets the OAuth access token for the server or connector.
+func WithMCPAuthorization(token string) MCPOption {
+	return func(m map[string]any) { m["authorization"] = token }
+}
+
+// WithMCPHeaders sets HTTP headers sent to the server.
+func WithMCPHeaders(headers map[string]string) MCPOption {
+	return func(m map[string]any) { m["headers"] = maps.Clone(headers) }
+}
+
+// WithMCPServerDescription describes the server to the model.
+func WithMCPServerDescription(description string) MCPOption {
+	return func(m map[string]any) { m["server_description"] = description }
+}
+
+// WithMCPAllowedTools limits the tools the model may call.
+func WithMCPAllowedTools(filter MCPToolFilter) MCPOption {
+	return func(m map[string]any) { m["allowed_tools"] = filter.wire() }
+}
+
+// WithMCPRequireApproval sets one approval policy for every tool: "always"
+// or "never".
+func WithMCPRequireApproval(policy string) MCPOption {
+	return func(m map[string]any) { m["require_approval"] = policy }
+}
+
+// WithMCPApprovalFilter requires approval for the tools in always and skips it
+// for those in never.
+func WithMCPApprovalFilter(always, never MCPToolFilter) MCPOption {
+	return func(m map[string]any) {
+		m["require_approval"] = map[string]any{"always": always.wire(), "never": never.wire()}
+	}
+}
+
+// WithMCPDeferLoading loads the server's tools only when the model searches
+// for them.
+func WithMCPDeferLoading() MCPOption {
+	return func(m map[string]any) { m["defer_loading"] = true }
+}
+
+// WithMCPAllowedCallers limits who may call the tools: "direct" (the model)
+// and "programmatic".
+func WithMCPAllowedCallers(callers ...string) MCPOption {
+	return func(m map[string]any) { m["allowed_callers"] = append([]string(nil), callers...) }
+}
+
+func mcpTool(serverLabel string, opts ...MCPOption) provider.ToolDefinition {
+	providerOpts := map[string]any{"server_label": serverLabel}
+	for _, o := range opts {
+		o(providerOpts)
+	}
+	return provider.ToolDefinition{
+		Name:                   serverLabel,
+		ProviderDefinedType:    "mcp",
 		ProviderDefinedOptions: providerOpts,
 	}
 }

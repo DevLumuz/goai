@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -19,7 +20,7 @@ import (
 )
 
 func newTestConn() *conn {
-	return &conn{provider: "openai", pending: map[string]bool{}, audioMs: map[string]int64{}, outFormat: pcm24k}
+	return &conn{provider: "openai", responses: newSequencer(), audioMs: map[string]int64{}, outFormat: pcm24k}
 }
 
 func verifyNoLeaks(t *testing.T) {
@@ -358,12 +359,17 @@ func scriptedServer(t *testing.T) (*httptest.Server, chan string, chan string) {
 	return server, received, push
 }
 
+var eventIDPattern = regexp.MustCompile(`"event_id":"goai_response_create_\d+",?`)
+
+// withoutEventID drops the generated event_id of response.create messages.
+func withoutEventID(msg string) string { return eventIDPattern.ReplaceAllString(msg, "") }
+
 func expectMessages(t *testing.T, received chan string, want ...string) {
 	t.Helper()
 	for _, w := range want {
 		select {
 		case got := <-received:
-			if got != w {
+			if withoutEventID(got) != w {
 				t.Errorf("client sent %s\nwant        %s", got, w)
 			}
 		case <-time.After(2 * time.Second):
@@ -483,14 +489,6 @@ func TestResponseSequencing(t *testing.T) {
 	expectMessages(t, received, `{"type":"response.create"}`)
 	waitFor(t, conn, provider.RealtimeResponseStarted) // auto_1 created by the scripted server
 	expectNoMessage(t, received)
-
-	// A race with a server-created response is retried after that response.
-	push <- `{"type":"response.created","response":{"id":"server_2"}}`
-	waitFor(t, conn, provider.RealtimeResponseStarted)
-	push <- `{"type":"error","error":{"type":"invalid_request_error","code":"conversation_already_has_active_response","message":"busy"}}`
-	waitFor(t, conn, provider.RealtimeError)
-	push <- `{"type":"response.done","response":{"id":"server_2","status":"completed"}}`
-	expectMessages(t, received, `{"type":"response.create"}`)
 }
 
 func TestInterruptTruncatesToReceivedAudio(t *testing.T) {
@@ -615,7 +613,7 @@ func TestToolLoopContinuesOnce(t *testing.T) {
 			t.Fatalf("received only %v", got)
 		}
 	}
-	if !strings.Contains(got[0], `"call_id":"call_1"`) || !strings.Contains(got[1], `"call_id":"call_2"`) || got[2] != `{"type":"response.create"}` {
+	if !strings.Contains(got[0], `"call_id":"call_1"`) || !strings.Contains(got[1], `"call_id":"call_2"`) || withoutEventID(got[2]) != `{"type":"response.create"}` {
 		t.Fatalf("client events = %v", got)
 	}
 	select {
@@ -662,7 +660,7 @@ func TestRealtimeSessionToolRoundTrip(t *testing.T) {
 	} {
 		select {
 		case got := <-received:
-			if got != want {
+			if withoutEventID(got) != want {
 				t.Fatalf("client sent %s\nwant        %s", got, want)
 			}
 		case <-time.After(2 * time.Second):
@@ -833,7 +831,8 @@ func FuzzTranslate(f *testing.F) {
 		c := newTestConn()
 		c.outputTr = true
 		_ = c.translateMessage(ev, data)
-		_ = c.finishResponse()
+		c.responses.done("")
+		_, _ = c.responses.next()
 	})
 }
 

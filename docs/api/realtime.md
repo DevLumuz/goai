@@ -29,6 +29,7 @@ All methods are safe for concurrent use. Input buffers are copied before sending
 | `StartInputActivity(ctx) error` / `EndInputActivity(ctx) error` | Marks user speech in `TurnModeClientVAD`. |
 | `CommitInput(ctx) error` | Ends the buffered input turn in `TurnModeManual`. |
 | `RequestResponse(ctx) error` | Asks for a response explicitly. |
+| `RequestResponseWith(ctx, providerOptions map[string]any) error` | Asks for a response with provider-specific parameters, such as `openai.RealtimeResponse(...)`. |
 | `Interrupt(ctx, cursor *provider.PlaybackCursor) error` | Cancels the active response; `cursor` reports how much audio was actually played. |
 | `AppendContext(ctx, provider.RealtimeContext) error` | Sends a delegation result or session context to a delegating model. |
 | `InputImage(ctx, provider.RealtimeMedia) error` | Sends an encoded image or video frame. |
@@ -97,7 +98,7 @@ type RealtimeCapableModel interface {
 | `RealtimeParams` | Initial session configuration built from the options above. |
 | `TurnDetection` | `Mode`, `DisableAutoResponse`, `DisableInterruption`, provider options. |
 | `TranscriptionConfig` | `Enabled`, `Language`, `Prompt`, provider options. |
-| `RealtimeClientEvent` | Commands: audio, activity, text, image, tool result, response create/cancel, context, conversation, session update, raw. |
+| `RealtimeClientEvent` | Commands: audio, activity, text, image, tool result, response create/cancel, context, conversation, session update, raw; `ProviderOptions` merge into the message written. |
 | `RealtimeMedia` | MIME type and encoded bytes of an image or video frame. |
 | `RealtimeConversation` | Messages to add to the history, and whether to respond after them. |
 | `RealtimeSessionUpdate` / `goai.RealtimeUpdate` | Live session changes; nil fields keep their value, an empty non-nil `Tools` removes all tools. |

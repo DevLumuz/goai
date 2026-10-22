@@ -21,6 +21,14 @@ type serverEvent struct {
 	RateLimits   []wireRateLimit `json:"rate_limits"`
 	AudioStartMs int64           `json:"audio_start_ms"`
 	AudioEndMs   int64           `json:"audio_end_ms"`
+	Text         string          `json:"text"`
+	Logprobs     json.RawMessage `json:"logprobs"`
+	Usage        json.RawMessage `json:"usage"` // transcription usage
+	// Diarized transcription segments carry their speaker and time span.
+	ID      string  `json:"id"`
+	Speaker string  `json:"speaker"`
+	Start   float64 `json:"start"`
+	End     float64 `json:"end"`
 }
 
 type wireSession struct {
@@ -28,6 +36,7 @@ type wireSession struct {
 }
 
 type wireError struct {
+	EventID string `json:"event_id"`
 	Type    string `json:"type"`
 	Code    string `json:"code"`
 	Message string `json:"message"`
@@ -35,11 +44,14 @@ type wireError struct {
 }
 
 type wireResponse struct {
-	ID            string             `json:"id"`
-	Status        string             `json:"status"`
-	StatusDetails *wireStatusDetails `json:"status_details"`
-	Output        []wireOutputItem   `json:"output"`
-	Usage         *wireUsage         `json:"usage"`
+	ID string `json:"id"`
+	// ConversationID is null for a response outside the default conversation.
+	ConversationID json.RawMessage    `json:"conversation_id"`
+	Metadata       map[string]any     `json:"metadata"`
+	Status         string             `json:"status"`
+	StatusDetails  *wireStatusDetails `json:"status_details"`
+	Output         []wireOutputItem   `json:"output"`
+	Usage          *wireUsage         `json:"usage"`
 }
 
 type wireStatusDetails struct {
@@ -53,12 +65,19 @@ type wireOutputItem struct {
 }
 
 type wireUsage struct {
-	TotalTokens       int `json:"total_tokens"`
-	InputTokens       int `json:"input_tokens"`
-	OutputTokens      int `json:"output_tokens"`
-	InputTokenDetails *struct {
+	TotalTokens        int             `json:"total_tokens"`
+	InputTokens        int             `json:"input_tokens"`
+	OutputTokens       int             `json:"output_tokens"`
+	InputTokenDetails  json.RawMessage `json:"input_token_details"`
+	OutputTokenDetails json.RawMessage `json:"output_token_details"`
+}
+
+func (u *wireUsage) cachedTokens() int {
+	var details struct {
 		CachedTokens int `json:"cached_tokens"`
-	} `json:"input_token_details"`
+	}
+	_ = json.Unmarshal(u.InputTokenDetails, &details)
+	return details.CachedTokens
 }
 
 type wireRateLimit struct {

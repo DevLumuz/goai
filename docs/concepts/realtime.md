@@ -138,6 +138,7 @@ Video is a stream of such frames; send them at the rate the provider documents (
 
 - `AppendConversation` adds messages to the history, for example to restore an earlier conversation; `RequestResponse` asks the model to answer once they are in.
 - `UpdateSession` changes instructions, tools, or provider settings without reconnecting, where `RuntimeSessionUpdate` is set (Gemini Live only on Vertex AI). A nil field keeps its value; a non-nil empty `Tools` removes every tool. The session dispatches the new tools from then on.
+- `RequestResponseWith` asks for one response with provider parameters, such as OpenAI's per-response instructions or out-of-band responses.
 - `EndInputAudio` tells the provider the microphone paused, so it can flush buffered audio (`InputAudioEnd`).
 
 ## Raw Provider Events

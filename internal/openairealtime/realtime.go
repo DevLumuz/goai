@@ -78,6 +78,7 @@ func (m *model) RealtimeCapabilities() provider.RealtimeCapabilities {
 		InputTranscription:      true,
 		OutputTranscription:     true,
 		TextInput:               true,
+		ImageInput:              true,
 		ProviderVAD:             true,
 		ManualTurnControl:       true,
 		ExplicitResponseRequest: true,
@@ -87,6 +88,8 @@ func (m *model) RealtimeCapabilities() provider.RealtimeCapabilities {
 		FunctionCalling:         true,
 		BlockingToolCalls:       true,
 		ParallelToolCalls:       true,
+		RuntimeSessionUpdate:    true,
+		ConversationAppend:      true,
 		UsageUpdates:            true,
 		RateLimitUpdates:        true,
 		RawEvents:               true,
@@ -143,7 +146,7 @@ func (m *model) OpenRealtime(ctx context.Context, params provider.RealtimeParams
 		autoResponse: !params.TurnDetection.DisableAutoResponse,
 		outputTr:     params.OutputTranscription.Enabled,
 		rawEvents:    params.IncludeRawEvents,
-		pending:      make(map[string]bool),
+		responses:    newSequencer(),
 		audioMs:      make(map[string]int64),
 	}
 	if err := c.configure(ctx, session); err != nil {
@@ -232,13 +235,13 @@ func buildSession(params provider.RealtimeParams) (map[string]any, provider.Audi
 		session["max_output_tokens"] = params.MaxOutputTokens
 	}
 	if len(params.Tools) > 0 {
-		tools, err := buildTools(params.Tools)
+		tools, err := BuildTools(params.Tools)
 		if err != nil {
 			return nil, provider.AudioFormat{}, err
 		}
 		session["tools"] = tools
 	}
-	if choice := buildToolChoice(params.ToolChoice); choice != nil {
+	if choice := ToolChoice(params.ToolChoice); choice != nil {
 		session["tool_choice"] = choice
 	}
 	session, err = mergeProviderOptions(session, params.ProviderOptions)
@@ -303,9 +306,19 @@ func buildTurnDetection(td provider.TurnDetection) (turnDetection, error) {
 	return turnDetection{set: true, value: value}, nil
 }
 
-func buildTools(defs []provider.ToolDefinition) ([]map[string]any, error) {
+// BuildTools maps tool definitions to Realtime tools: functions, and MCP
+// servers declared as provider-defined "mcp" tools.
+func BuildTools(defs []provider.ToolDefinition) ([]map[string]any, error) {
 	tools := make([]map[string]any, 0, len(defs))
 	for _, def := range defs {
+		if def.ProviderDefinedType == "mcp" {
+			tool := map[string]any{"type": "mcp"}
+			for k, v := range def.ProviderDefinedOptions {
+				tool[k] = v
+			}
+			tools = append(tools, tool)
+			continue
+		}
 		if def.ProviderDefinedType != "" {
 			return nil, fmt.Errorf("%w: provider-defined tool %s in a realtime session", provider.ErrRealtimeUnsupported, def.Name)
 		}
@@ -326,7 +339,8 @@ func buildTools(defs []provider.ToolDefinition) ([]map[string]any, error) {
 	return tools, nil
 }
 
-func buildToolChoice(choice string) any {
+// ToolChoice maps a tool choice to its Realtime value; nil keeps the default.
+func ToolChoice(choice string) any {
 	switch choice {
 	case "":
 		return nil
@@ -370,17 +384,10 @@ type conn struct {
 	outputTr     bool
 	rawEvents    bool
 
-	// stateMu guards response sequencing, the tool loop, and audio lengths.
-	// Like the official Agents SDK, response.create is never sent while a
-	// response is in progress: requests made meanwhile coalesce into one.
-	stateMu        sync.Mutex
-	ongoing        bool // between response.created and response.done
-	createInFlight bool // response.create sent, response.created not yet seen
-	wantCreate     bool // a response was requested while another was active
-	pending        map[string]bool
-	toolTurn       bool
-	respDone       bool
-	audioMs        map[string]int64 // received output audio per item, for truncation
+	responses *sequencer
+
+	audioMu sync.Mutex
+	audioMs map[string]int64 // received output audio per item, for truncation
 
 	// Reader goroutine only. setup holds events produced while configuring,
 	// delivered before anything the reader reads.
@@ -527,22 +534,35 @@ func (c *conn) Send(ctx context.Context, event provider.RealtimeClientEvent) err
 		}
 		return c.sendError(c.ws.Write(ctx, realtimews.MessageText, event.Raw))
 	}
-	msgs, respond, err := c.encode(event)
+	msgs, response, err := c.encode(event)
 	if err != nil {
 		return err
 	}
 	// Content goes out before any response request is registered: otherwise the
-	// reader could send a coalesced response.create ahead of it on response.done.
+	// reader could send a queued response.create ahead of it on response.done.
 	for _, msg := range msgs {
 		if err := c.writeEvent(ctx, msg); err != nil {
 			return err
 		}
 	}
 	if event.Type == provider.RealtimeToolResultEvent {
-		respond = c.toolOutputSent(event.ToolResult.ToolCallID)
+		c.responses.toolOutput(event.ToolResult.ToolCallID)
 	}
-	if respond && c.requestResponse() {
-		return c.writeEvent(ctx, clientEvent{"type": "response.create"})
+	if response != nil {
+		c.responses.request(response.params)
+	}
+	return c.dispatch(ctx)
+}
+
+// dispatch sends the next queued response.create when the slot is free.
+func (c *conn) dispatch(ctx context.Context) error {
+	ev, ok := c.responses.next()
+	if !ok {
+		return nil
+	}
+	if err := c.writeEvent(ctx, ev); err != nil {
+		c.responses.sendFailed(ev["event_id"].(string))
+		return err
 	}
 	return nil
 }
@@ -562,71 +582,21 @@ func (c *conn) sendError(err error) error {
 	return fmt.Errorf("%s: sending realtime event: %w", c.provider, err)
 }
 
-// requestResponse reports whether response.create can be sent now. Otherwise
-// the request is kept and sent when the active response finishes.
-func (c *conn) requestResponse() bool {
-	c.stateMu.Lock()
-	defer c.stateMu.Unlock()
-	if c.ongoing || c.createInFlight {
-		c.wantCreate = true
-		return false
-	}
-	c.createInFlight = true
-	return true
-}
-
-// encode maps a client event to wire events. respond reports whether the
-// event also asks for a model response, which goes through requestResponse.
-func (c *conn) encode(event provider.RealtimeClientEvent) (msgs []clientEvent, respond bool, err error) {
-	switch event.Type {
-	case provider.RealtimeInputAudioAppend:
-		if len(event.Audio) == 0 {
-			return nil, false, fmt.Errorf("%w: empty audio frame", provider.ErrInvalidRealtimeConfig)
-		}
-		return []clientEvent{{"type": "input_audio_buffer.append", "audio": base64.StdEncoding.EncodeToString(event.Audio)}}, false, nil
-	case provider.RealtimeInputAudioCommit:
-		return []clientEvent{{"type": "input_audio_buffer.commit"}}, false, nil
-	case provider.RealtimeResponseCreate:
-		return nil, true, nil
-	case provider.RealtimeTextInput:
-		return []clientEvent{{"type": "conversation.item.create", "item": map[string]any{
-			"type":    "message",
-			"role":    "user",
-			"content": []map[string]any{{"type": "input_text", "text": event.Text}},
-		}}}, c.autoResponse, nil
-	case provider.RealtimeToolResultEvent:
-		result := event.ToolResult
-		if result == nil || result.ToolCallID == "" {
-			return nil, false, fmt.Errorf("%w: tool result needs a tool call ID", provider.ErrInvalidRealtimeConfig)
-		}
-		return []clientEvent{{"type": "conversation.item.create", "item": map[string]any{
-			"type":    "function_call_output",
-			"call_id": result.ToolCallID,
-			"output":  string(result.Output),
-		}}}, false, nil
-	case provider.RealtimeResponseCancel:
-		return c.encodeInterrupt(event.Cursor), false, nil
-	default:
-		return nil, false, fmt.Errorf("%w: openai realtime does not support %s", provider.ErrRealtimeUnsupported, event.Type)
-	}
-}
-
 // encodeInterrupt cancels the active response, if any, and truncates the
 // played item to the audio that actually reached it. Like the official Agents
 // SDK, nothing is cancelled without an active response and truncation is
 // clamped to the audio received for that item.
 func (c *conn) encodeInterrupt(cur *provider.PlaybackCursor) []clientEvent {
-	c.stateMu.Lock()
-	defer c.stateMu.Unlock()
 	var msgs []clientEvent
-	if c.ongoing {
+	if c.responses.active() {
 		msgs = append(msgs, clientEvent{"type": "response.cancel"})
 	}
-	c.wantCreate = false
 	if cur == nil || cur.ItemID == "" {
 		return msgs
 	}
+	c.audioMu.Lock()
 	received, known := c.audioMs[cur.ItemID]
+	c.audioMu.Unlock()
 	if !known {
 		return msgs
 	}
@@ -637,24 +607,6 @@ func (c *conn) encodeInterrupt(cur *provider.PlaybackCursor) []clientEvent {
 		"content_index": 0,
 		"audio_end_ms":  played,
 	})
-}
-
-// toolOutputSent records a tool output and reports whether it was the last
-// one the finished response was waiting for.
-func (c *conn) toolOutputSent(callID string) bool {
-	c.stateMu.Lock()
-	defer c.stateMu.Unlock()
-	delete(c.pending, callID)
-	return c.continueToolTurn()
-}
-
-// continueToolTurn must be called with stateMu held.
-func (c *conn) continueToolTurn() bool {
-	if c.toolTurn && c.respDone && len(c.pending) == 0 {
-		c.toolTurn = false
-		return true
-	}
-	return false
 }
 
 func (c *conn) readLoop() {
@@ -678,10 +630,8 @@ func (c *conn) readLoop() {
 		if !c.emit(c.translateMessage(ev, data)) {
 			return
 		}
-		if ev.Type == "response.done" && c.finishResponse() {
-			if err := c.write(c.ctx, clientEvent{"type": "response.create"}); err != nil && c.ctx.Err() == nil {
-				c.setErr(fmt.Errorf("%s: creating the next response: %w", c.provider, err))
-			}
+		if err := c.dispatch(c.ctx); err != nil && c.ctx.Err() == nil {
+			c.setErr(fmt.Errorf("%s: creating the next response: %w", c.provider, err))
 		}
 	}
 }
@@ -702,27 +652,12 @@ func (c *conn) emit(events []provider.RealtimeEvent) bool {
 	return true
 }
 
-// finishResponse closes the active response and reports whether a
-// response.create is due: a coalesced request or a completed tool turn.
-func (c *conn) finishResponse() bool {
-	c.stateMu.Lock()
-	defer c.stateMu.Unlock()
-	c.ongoing = false
-	c.respDone = true
-	if c.continueToolTurn() {
-		c.wantCreate = true
-	}
-	if c.wantCreate && !c.createInFlight {
-		c.wantCreate = false
-		c.createInFlight = true
-		return true
-	}
-	return false
-}
-
 // translate maps one server event to common events and reports whether the
 // adapter knows its type. Reader goroutine only.
 func (c *conn) translate(ev serverEvent) ([]provider.RealtimeEvent, bool) {
+	one := func(e provider.RealtimeEvent) ([]provider.RealtimeEvent, bool) {
+		return []provider.RealtimeEvent{e}, true
+	}
 	switch ev.Type {
 	case "session.created":
 		// The session ID travels on RealtimeSessionReady, sent once configured.
@@ -731,64 +666,74 @@ func (c *conn) translate(ev serverEvent) ([]provider.RealtimeEvent, bool) {
 		}
 		return nil, true
 	case "input_audio_buffer.speech_started":
-		return []provider.RealtimeEvent{{Type: provider.RealtimeInputSpeechStarted, ItemID: ev.ItemID}}, true
+		return one(provider.RealtimeEvent{Type: provider.RealtimeInputSpeechStarted, ItemID: ev.ItemID, AudioStart: msDuration(ev.AudioStartMs)})
 	case "input_audio_buffer.speech_stopped":
-		return []provider.RealtimeEvent{{Type: provider.RealtimeInputSpeechStopped, ItemID: ev.ItemID}}, true
+		return one(provider.RealtimeEvent{Type: provider.RealtimeInputSpeechStopped, ItemID: ev.ItemID, AudioEnd: msDuration(ev.AudioEndMs)})
 	case "conversation.item.input_audio_transcription.delta":
-		return []provider.RealtimeEvent{{Type: provider.RealtimeInputTranscript, ItemID: ev.ItemID, Text: ev.Delta}}, true
+		return one(provider.RealtimeEvent{Type: provider.RealtimeInputTranscript, ItemID: ev.ItemID, Text: ev.Delta,
+			ProviderMetadata: c.metadata("logprobs", ev.Logprobs)})
 	case "conversation.item.input_audio_transcription.completed":
-		return []provider.RealtimeEvent{{Type: provider.RealtimeInputTranscript, ItemID: ev.ItemID, Text: ev.Transcript, IsFinal: true}}, true
+		return one(provider.RealtimeEvent{Type: provider.RealtimeInputTranscript, ItemID: ev.ItemID, Text: ev.Transcript, IsFinal: true,
+			ProviderMetadata: c.metadata("logprobs", ev.Logprobs, "usage", ev.Usage)})
+	case "conversation.item.input_audio_transcription.segment":
+		return one(provider.RealtimeEvent{Type: provider.RealtimeInputTranscript, ItemID: ev.ItemID, Text: ev.Text, Speaker: ev.Speaker,
+			AudioStart: secondsToDuration(ev.Start), AudioEnd: secondsToDuration(ev.End),
+			ProviderMetadata: c.metadata("segmentId", ev.ID)})
 	case "conversation.item.input_audio_transcription.failed":
-		return []provider.RealtimeEvent{{Type: provider.RealtimeError, ItemID: ev.ItemID, Error: c.serverError(ev.Error)}}, true
+		return one(provider.RealtimeEvent{Type: provider.RealtimeError, ItemID: ev.ItemID, Error: c.serverError(ev.Error)})
 	case "response.created":
-		c.stateMu.Lock()
-		c.ongoing, c.createInFlight = true, false
-		c.respDone, c.toolTurn = false, false
-		clear(c.pending)
-		c.stateMu.Unlock()
-		id := ""
-		if ev.Response != nil {
-			id = ev.Response.ID
+		var id string
+		inConversation := true
+		var meta map[string]any
+		if r := ev.Response; r != nil {
+			id = r.ID
+			inConversation = string(r.ConversationID) != "null"
+			meta = c.metadata("metadata", r.Metadata, "conversationId", r.ConversationID)
 		}
-		return []provider.RealtimeEvent{{Type: provider.RealtimeResponseStarted, ResponseID: id}}, true
+		c.responses.created(id, inConversation)
+		return one(provider.RealtimeEvent{Type: provider.RealtimeResponseStarted, ResponseID: id, ProviderMetadata: meta})
 	case "response.output_audio.delta":
 		audio, err := base64.StdEncoding.DecodeString(ev.Delta)
 		if err != nil {
-			return []provider.RealtimeEvent{{Type: provider.RealtimeError, Error: fmt.Errorf("%s: decoding output audio: %w", c.provider, err)}}, true
+			return one(provider.RealtimeEvent{Type: provider.RealtimeError, Error: fmt.Errorf("%s: decoding output audio: %w", c.provider, err)})
 		}
-		c.stateMu.Lock()
+		c.audioMu.Lock()
 		c.audioMs[ev.ItemID] += audioDuration(len(audio), c.outFormat)
-		c.stateMu.Unlock()
-		return []provider.RealtimeEvent{{Type: provider.RealtimeOutputAudio, ResponseID: ev.ResponseID, ItemID: ev.ItemID, Audio: audio, AudioFormat: c.outFormat}}, true
+		c.audioMu.Unlock()
+		return one(provider.RealtimeEvent{Type: provider.RealtimeOutputAudio, ResponseID: ev.ResponseID, ItemID: ev.ItemID, Audio: audio, AudioFormat: c.outFormat})
 	case "response.output_audio_transcript.delta":
 		if !c.outputTr {
 			return nil, true
 		}
-		return []provider.RealtimeEvent{{Type: provider.RealtimeOutputTranscript, ResponseID: ev.ResponseID, ItemID: ev.ItemID, Text: ev.Delta}}, true
+		return one(provider.RealtimeEvent{Type: provider.RealtimeOutputTranscript, ResponseID: ev.ResponseID, ItemID: ev.ItemID, Text: ev.Delta})
 	case "response.output_audio_transcript.done":
 		if !c.outputTr {
 			return nil, true
 		}
-		return []provider.RealtimeEvent{{Type: provider.RealtimeOutputTranscript, ResponseID: ev.ResponseID, ItemID: ev.ItemID, Text: ev.Transcript, IsFinal: true}}, true
+		return one(provider.RealtimeEvent{Type: provider.RealtimeOutputTranscript, ResponseID: ev.ResponseID, ItemID: ev.ItemID, Text: ev.Transcript, IsFinal: true})
 	case "response.output_text.delta":
-		return []provider.RealtimeEvent{{Type: provider.RealtimeTextDelta, ResponseID: ev.ResponseID, ItemID: ev.ItemID, Text: ev.Delta}}, true
+		return one(provider.RealtimeEvent{Type: provider.RealtimeTextDelta, ResponseID: ev.ResponseID, ItemID: ev.ItemID, Text: ev.Delta})
+	case "response.output_text.done":
+		return one(provider.RealtimeEvent{Type: provider.RealtimeTextDelta, ResponseID: ev.ResponseID, ItemID: ev.ItemID, Text: ev.Text, IsFinal: true})
 	case "response.function_call_arguments.done":
-		c.stateMu.Lock()
-		c.pending[ev.CallID] = true
-		c.toolTurn = true
-		c.stateMu.Unlock()
+		c.responses.toolCall(ev.CallID, ev.ResponseID)
 		input := json.RawMessage(ev.Arguments)
 		if len(input) == 0 || !json.Valid(input) {
 			input = json.RawMessage(`{}`)
 		}
-		return []provider.RealtimeEvent{{
+		return one(provider.RealtimeEvent{
 			Type:       provider.RealtimeToolCallEvent,
 			ResponseID: ev.ResponseID,
 			ItemID:     ev.ItemID,
 			ToolCallID: ev.CallID,
 			ToolCall:   &provider.RealtimeToolCall{ID: ev.CallID, Name: ev.Name, Input: input},
-		}}, true
+		})
 	case "response.done":
+		id := ""
+		if ev.Response != nil {
+			id = ev.Response.ID
+		}
+		c.responses.done(id)
 		return c.responseDone(ev.Response), true
 	case "rate_limits.updated":
 		limits := make([]provider.RealtimeRateLimit, 0, len(ev.RateLimits))
@@ -800,18 +745,44 @@ func (c *conn) translate(ev serverEvent) ([]provider.RealtimeEvent, bool) {
 				ResetAfter: secondsToDuration(rl.ResetSeconds),
 			})
 		}
-		return []provider.RealtimeEvent{{Type: provider.RealtimeRateLimitsUpdated, RateLimits: limits}}, true
+		return one(provider.RealtimeEvent{Type: provider.RealtimeRateLimitsUpdated, RateLimits: limits})
 	case "error":
-		if ev.Error != nil && ev.Error.Code == "conversation_already_has_active_response" {
-			// Our request raced a server-created response: retry after it ends.
-			c.stateMu.Lock()
-			c.createInFlight, c.wantCreate = false, true
-			c.stateMu.Unlock()
-		}
-		return []provider.RealtimeEvent{{Type: provider.RealtimeError, Error: c.serverError(ev.Error)}}, true
+		// A rejected response.create is dropped, not retried (see sequencer).
+		c.responses.rejected(ev.Error)
+		return one(provider.RealtimeEvent{Type: provider.RealtimeError, Error: c.serverError(ev.Error)})
 	}
 	return nil, false
 }
+
+// metadata builds ProviderMetadata under the provider's key from key/value
+// pairs, leaving out empty values. Raw JSON values are decoded.
+func (c *conn) metadata(kv ...any) map[string]any {
+	fields := map[string]any{}
+	for i := 0; i+1 < len(kv); i += 2 {
+		key, _ := kv[i].(string)
+		switch v := kv[i+1].(type) {
+		case json.RawMessage:
+			var decoded any
+			if len(v) > 0 && json.Unmarshal(v, &decoded) == nil && decoded != nil {
+				fields[key] = decoded
+			}
+		case string:
+			if v != "" {
+				fields[key] = v
+			}
+		case map[string]any:
+			if len(v) > 0 {
+				fields[key] = v
+			}
+		}
+	}
+	if len(fields) == 0 {
+		return nil
+	}
+	return map[string]any{c.provider: fields}
+}
+
+func msDuration(ms int64) time.Duration { return time.Duration(ms) * time.Millisecond }
 
 // audioDuration returns the milliseconds of audio in n bytes of format f.
 func audioDuration(n int, f provider.AudioFormat) int64 {
@@ -831,9 +802,10 @@ func (c *conn) responseDone(resp *wireResponse) []provider.RealtimeEvent {
 		return []provider.RealtimeEvent{{Type: provider.RealtimeResponseFinished, FinishReason: provider.FinishStop}}
 	}
 	finished := provider.RealtimeEvent{
-		Type:         provider.RealtimeResponseFinished,
-		ResponseID:   resp.ID,
-		FinishReason: finishReason(resp),
+		Type:             provider.RealtimeResponseFinished,
+		ResponseID:       resp.ID,
+		FinishReason:     finishReason(resp),
+		ProviderMetadata: c.metadata("metadata", resp.Metadata, "conversationId", resp.ConversationID),
 	}
 	events := []provider.RealtimeEvent{finished}
 	if resp.Status == "failed" {
@@ -844,17 +816,17 @@ func (c *conn) responseDone(resp *wireResponse) []provider.RealtimeEvent {
 		events = append(events, provider.RealtimeEvent{Type: provider.RealtimeError, ResponseID: resp.ID, Error: c.serverError(detail)})
 	}
 	if u := resp.Usage; u != nil {
-		cached := 0
-		if u.InputTokenDetails != nil {
-			cached = u.InputTokenDetails.CachedTokens
-		}
+		cached := u.cachedTokens()
 		events[0].Usage = provider.Usage{
 			InputTokens:     max(u.InputTokens-cached, 0),
 			CacheReadTokens: cached,
 			OutputTokens:    u.OutputTokens,
 			TotalTokens:     u.TotalTokens,
 		}
-		events = append(events, provider.RealtimeEvent{Type: provider.RealtimeUsageUpdated, ResponseID: resp.ID, Usage: events[0].Usage})
+		events = append(events, provider.RealtimeEvent{
+			Type: provider.RealtimeUsageUpdated, ResponseID: resp.ID, Usage: events[0].Usage,
+			ProviderMetadata: c.metadata("inputTokenDetails", u.InputTokenDetails, "outputTokenDetails", u.OutputTokenDetails),
+		})
 	}
 	return events
 }

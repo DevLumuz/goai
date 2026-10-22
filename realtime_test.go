@@ -243,6 +243,7 @@ func TestRealtimeSessionInputMethodsAndCopies(t *testing.T) {
 		{func() error { return session.EndInputActivity(t.Context()) }, provider.RealtimeInputActivityEnd},
 		{func() error { return session.SendText(t.Context(), "hello") }, provider.RealtimeTextInput},
 		{func() error { return session.RequestResponse(t.Context()) }, provider.RealtimeResponseCreate},
+		{func() error { return session.RequestResponseWith(t.Context(), map[string]any{"k": "v"}) }, provider.RealtimeResponseCreate},
 	}
 	for _, call := range calls {
 		if err := call.invoke(); err != nil {
@@ -720,25 +721,25 @@ func TestEncodeRealtimeToolOutput(t *testing.T) {
 
 func TestRealtimeCloneHelpers(t *testing.T) {
 	event := provider.RealtimeClientEvent{
-		Audio:      []byte{1},
-		Metadata:   map[string]any{"list": []any{map[string]any{"k": "v"}}, "strings": []string{"a"}, "raw": json.RawMessage(`1`)},
-		Cursor:     &provider.PlaybackCursor{ItemID: "i"},
-		Context:    &provider.RealtimeContext{Text: "t"},
-		ToolResult: &provider.RealtimeToolResult{ToolCallID: "c", Output: json.RawMessage(`{}`)},
+		Audio:           []byte{1},
+		ProviderOptions: map[string]any{"list": []any{map[string]any{"k": "v"}}, "strings": []string{"a"}, "raw": json.RawMessage(`1`)},
+		Cursor:          &provider.PlaybackCursor{ItemID: "i"},
+		Context:         &provider.RealtimeContext{Text: "t"},
+		ToolResult:      &provider.RealtimeToolResult{ToolCallID: "c", Output: json.RawMessage(`{}`)},
 	}
 	clone := cloneRealtimeClientEvent(event)
 	event.Audio[0] = 9
 	event.Context.Text = "changed"
 	event.Cursor.ItemID = "changed"
 	event.ToolResult.Output[0] = 'x'
-	event.Metadata["list"].([]any)[0].(map[string]any)["k"] = "changed"
-	event.Metadata["strings"].([]string)[0] = "changed"
-	event.Metadata["raw"].(json.RawMessage)[0] = '2'
+	event.ProviderOptions["list"].([]any)[0].(map[string]any)["k"] = "changed"
+	event.ProviderOptions["strings"].([]string)[0] = "changed"
+	event.ProviderOptions["raw"].(json.RawMessage)[0] = '2'
 	if clone.Audio[0] != 1 || clone.Cursor.ItemID != "i" || clone.Context.Text != "t" || string(clone.ToolResult.Output) != `{}` {
 		t.Fatalf("client event aliased: %+v", clone)
 	}
-	if clone.Metadata["list"].([]any)[0].(map[string]any)["k"] != "v" || clone.Metadata["strings"].([]string)[0] != "a" || string(clone.Metadata["raw"].(json.RawMessage)) != "1" {
-		t.Fatalf("metadata aliased: %+v", clone.Metadata)
+	if clone.ProviderOptions["list"].([]any)[0].(map[string]any)["k"] != "v" || clone.ProviderOptions["strings"].([]string)[0] != "a" || string(clone.ProviderOptions["raw"].(json.RawMessage)) != "1" {
+		t.Fatalf("metadata aliased: %+v", clone.ProviderOptions)
 	}
 	delegation := provider.RealtimeEvent{Delegation: &provider.RealtimeDelegation{ID: "d"}}
 	cloned := cloneRealtimeEvent(delegation)
