@@ -1035,3 +1035,220 @@ func TestRealtimeParityCloneHelpers(t *testing.T) {
 		t.Fatalf("event aliased: %+v", cloned)
 	}
 }
+
+// resumingModel hands out the given connections in order and records the
+// params of each open.
+type resumingModel struct {
+	mu     sync.Mutex
+	conns  []provider.RealtimeConnection
+	fails  int // opens that fail before the next connection is handed out
+	params []provider.RealtimeParams
+}
+
+func (m *resumingModel) ModelID() string { return "resuming" }
+
+func (m *resumingModel) OpenRealtime(_ context.Context, params provider.RealtimeParams) (provider.RealtimeConnection, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.params = append(m.params, cloneRealtimeParams(params))
+	if len(m.params) > 1 && m.fails > 0 {
+		m.fails--
+		return nil, errors.New("open failed")
+	}
+	conn := m.conns[0]
+	m.conns = m.conns[1:]
+	return conn, nil
+}
+
+func (m *resumingModel) opened() []provider.RealtimeParams {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]provider.RealtimeParams(nil), m.params...)
+}
+
+func TestRealtimeSessionAutoResumeOnGoAway(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	first, second := newFakeRealtimeConnection(8, 8), newFakeRealtimeConnection(8, 8)
+	model := &resumingModel{conns: []provider.RealtimeConnection{first, second}}
+	session, err := OpenRealtimeSession(t.Context(), model, WithRealtimeAutoResume(3))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p := model.opened()[0]; p.Resumption == nil || p.Resumption.Token != "" {
+		t.Fatalf("auto-resume must enable resumption: %+v", p.Resumption)
+	}
+
+	first.events <- provider.RealtimeEvent{Type: provider.RealtimeSessionResumeState, ResumeToken: "tok-1"}
+	first.events <- provider.RealtimeEvent{Type: provider.RealtimeSessionResumeState} // not resumable now
+	first.events <- provider.RealtimeEvent{Type: provider.RealtimeSessionGoAway, TimeToClose: time.Minute}
+	for _, want := range []provider.RealtimeEventType{
+		provider.RealtimeSessionResumeState, provider.RealtimeSessionResumeState,
+		provider.RealtimeSessionGoAway, provider.RealtimeSessionResumed,
+	} {
+		if ev := receiveRealtimeEvent(t, session.Events()); ev.Type != want {
+			t.Fatalf("event = %s, want %s", ev.Type, want)
+		}
+	}
+	if p := model.opened()[1]; p.Resumption == nil || p.Resumption.Token != "tok-1" {
+		t.Fatalf("resumed with %+v, want the last token", p.Resumption)
+	}
+	select {
+	case <-first.closed:
+	case <-time.After(time.Second):
+		t.Fatal("the old connection was not closed")
+	}
+
+	if err := session.SendText(t.Context(), "after"); err != nil {
+		t.Fatal(err)
+	}
+	if got := receiveRealtimeClientEvent(t, second.sent); got.Text != "after" {
+		t.Fatalf("sent to the new connection: %+v", got)
+	}
+	second.events <- provider.RealtimeEvent{Type: provider.RealtimeTextDelta, Text: "from second"}
+	if ev := receiveRealtimeEvent(t, session.Events()); ev.Text != "from second" {
+		t.Fatalf("event = %+v", ev)
+	}
+	if err := session.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRealtimeSessionAutoResumeOnDrop(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	first, second := newFakeRealtimeConnection(8, 8), newFakeRealtimeConnection(8, 8)
+	model := &resumingModel{conns: []provider.RealtimeConnection{first, second}, fails: 1}
+	started := make(chan struct{})
+	cancelled := make(chan struct{})
+	slow := Tool{Name: "slow", Execute: func(ctx context.Context, _ json.RawMessage) (string, error) {
+		close(started)
+		<-ctx.Done()
+		close(cancelled)
+		return "", ctx.Err()
+	}}
+	session, err := OpenRealtimeSession(t.Context(), model, WithRealtimeAutoResume(2), WithRealtimeTools(slow))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	first.events <- provider.RealtimeEvent{Type: provider.RealtimeSessionResumeState, ResumeToken: "tok"}
+	first.events <- provider.RealtimeEvent{Type: provider.RealtimeToolCallEvent, ToolCall: &provider.RealtimeToolCall{ID: "c", Name: "slow"}}
+	_ = receiveRealtimeEvent(t, session.Events())
+	_ = receiveRealtimeEvent(t, session.Events())
+	<-started
+	first.finish(errors.New("connection reset"))
+
+	// One failed attempt, then the second connection.
+	if ev := receiveRealtimeEvent(t, session.Events()); ev.Type != provider.RealtimeSessionResumed {
+		t.Fatalf("event = %+v", ev)
+	}
+	select {
+	case <-cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("a tool of the old connection kept running")
+	}
+	if n := len(model.opened()); n != 3 {
+		t.Fatalf("opens = %d, want 3", n)
+	}
+	if err := session.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRealtimeSessionResumeLimits(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	t.Run("no token", func(t *testing.T) {
+		conn := newFakeRealtimeConnection(1, 1)
+		session, err := OpenRealtimeSession(t.Context(), &resumingModel{conns: []provider.RealtimeConnection{conn}}, WithRealtimeAutoResume(2))
+		if err != nil {
+			t.Fatal(err)
+		}
+		dropped := errors.New("dropped")
+		conn.finish(dropped)
+		waitRealtimeDone(t, session)
+		if !errors.Is(session.Err(), dropped) {
+			t.Fatalf("Err = %v", session.Err())
+		}
+	})
+
+	t.Run("attempts exhausted", func(t *testing.T) {
+		conn := newFakeRealtimeConnection(2, 1)
+		model := &resumingModel{conns: []provider.RealtimeConnection{conn}, fails: 5}
+		session, err := OpenRealtimeSession(t.Context(), model, WithRealtimeAutoResume(2))
+		if err != nil {
+			t.Fatal(err)
+		}
+		conn.events <- provider.RealtimeEvent{Type: provider.RealtimeSessionResumeState, ResumeToken: "tok"}
+		_ = receiveRealtimeEvent(t, session.Events())
+		dropped := errors.New("dropped")
+		conn.finish(dropped)
+		select {
+		case <-session.done:
+		case <-time.After(3 * time.Second):
+			t.Fatal("session did not end")
+		}
+		if !errors.Is(session.Err(), dropped) || len(model.opened()) != 3 {
+			t.Fatalf("Err = %v after %d opens", session.Err(), len(model.opened()))
+		}
+	})
+
+	t.Run("normal close is not resumed", func(t *testing.T) {
+		conn := newFakeRealtimeConnection(2, 1)
+		model := &resumingModel{conns: []provider.RealtimeConnection{conn}}
+		session, err := OpenRealtimeSession(t.Context(), model, WithRealtimeAutoResume(2))
+		if err != nil {
+			t.Fatal(err)
+		}
+		conn.events <- provider.RealtimeEvent{Type: provider.RealtimeSessionResumeState, ResumeToken: "tok"}
+		_ = receiveRealtimeEvent(t, session.Events())
+		conn.finish(nil)
+		waitRealtimeDone(t, session)
+		if session.Err() != nil || len(model.opened()) != 1 {
+			t.Fatalf("Err = %v after %d opens", session.Err(), len(model.opened()))
+		}
+	})
+
+	t.Run("off by default", func(t *testing.T) {
+		conn := newFakeRealtimeConnection(2, 1)
+		model := &resumingModel{conns: []provider.RealtimeConnection{conn}}
+		session, err := OpenRealtimeSession(t.Context(), model)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if model.opened()[0].Resumption != nil {
+			t.Fatal("resumption must be off by default")
+		}
+		conn.events <- provider.RealtimeEvent{Type: provider.RealtimeSessionResumeState, ResumeToken: "tok"}
+		conn.events <- provider.RealtimeEvent{Type: provider.RealtimeSessionGoAway}
+		_ = receiveRealtimeEvent(t, session.Events())
+		_ = receiveRealtimeEvent(t, session.Events())
+		if err := session.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if len(model.opened()) != 1 {
+			t.Fatal("reconnected without auto-resume")
+		}
+	})
+}
+
+func TestRealtimeResumptionOptions(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	conn := newFakeRealtimeConnection(1, 1)
+	model := &resumingModel{conns: []provider.RealtimeConnection{conn}}
+	session, err := OpenRealtimeSession(t.Context(), model, WithRealtimeResumption("earlier"), WithRealtimeAutoResume(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p := model.opened()[0]; p.Resumption == nil || p.Resumption.Token != "earlier" {
+		t.Fatalf("resumption = %+v", p.Resumption)
+	}
+	if err := session.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenRealtimeSession(t.Context(), model, WithRealtimeAutoResume(-1)); !errors.Is(err, provider.ErrInvalidRealtimeConfig) {
+		t.Fatalf("negative attempts: %v", err)
+	}
+}

@@ -510,3 +510,17 @@ func TestLive_PendingTurnWithoutOutput(t *testing.T) {
 		t.Fatalf("an idle empty turn reports nothing: %+v", events)
 	}
 }
+
+func TestLive_ResumptionParam(t *testing.T) {
+	for token, want := range map[string]string{"": `{}`, "h1": `{"handle":"h1"}`} {
+		setup, _, err := buildLiveSetup("models/m", provider.RealtimeParams{Resumption: &provider.RealtimeResumption{Token: token}}, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		jsonEqual(t, setup["sessionResumption"], want)
+	}
+	setup, _, _ := buildLiveSetup("models/m", provider.RealtimeParams{}, false)
+	if _, ok := setup["sessionResumption"]; ok {
+		t.Fatal("resumption must stay off unless requested")
+	}
+}

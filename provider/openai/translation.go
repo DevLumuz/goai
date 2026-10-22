@@ -137,6 +137,9 @@ func (m *translationModel) OpenRealtime(ctx context.Context, params provider.Rea
 // buildTranslationSession maps the params to session.update; an empty map
 // keeps the server defaults.
 func buildTranslationSession(params provider.RealtimeParams) (map[string]any, error) {
+	if params.Resumption != nil {
+		return nil, fmt.Errorf("%w: a translation session has no resumption", provider.ErrRealtimeUnsupported)
+	}
 	if params.System != "" || params.Voice != "" || len(params.Tools) > 0 || params.ToolChoice != "" || params.MaxOutputTokens > 0 {
 		return nil, fmt.Errorf("%w: a translation session has no instructions, voice, or tools", provider.ErrRealtimeUnsupported)
 	}

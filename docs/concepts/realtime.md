@@ -201,7 +201,8 @@ Because the model is full duplex, it handles turns and interruptions itself: the
 | `RealtimeToolCallEvent` / `RealtimeToolCallCancelled` | Tool calls and cancellations. |
 | `RealtimeUsageUpdated` | Token usage reported during the session. |
 | `RealtimeSessionGoAway` | The provider will close the connection after `TimeToClose`. |
-| `RealtimeSessionResumeState` | A `ResumeToken` that can resume the session on a new connection. |
+| `RealtimeSessionResumeState` | A `ResumeToken` that can resume the session on a new connection; empty while the session cannot be resumed. |
+| `RealtimeSessionResumed` | Auto-resume moved the session to a new connection. |
 | `RealtimeDelegationCreated` | A delegating model handed work to a backend; see [Delegation](#delegation). |
 | `RealtimeError` | A non-terminal provider error; terminal ones end the session and surface in `Err()`. |
 | `RealtimeProviderEvent` | A provider message as raw JSON; see [Raw Provider Events](#raw-provider-events). |
@@ -213,14 +214,15 @@ Transcript and speech events may also carry `IsInterim` (a revisable hypothesis)
 - `Events()` is a bounded queue (`WithRealtimeEventBuffer`). If your consumer stops draining it for longer than `WithRealtimeBackpressureTimeout` (one second by default), the session ends with `provider.ErrRealtimeBackpressure` instead of piling up stale audio.
 - `Close` is idempotent and waits for internal goroutines, including running tools. After `Events()` closes, `Err()` reports why; it is nil after a normal close.
 - The context passed to `OpenRealtimeSession` bounds the whole session.
-- GoAI never reconnects automatically: replaying a conversation could repeat tool side effects. Gemini sends `RealtimeSessionGoAway` before its connection limit and, when enabled, `RealtimeSessionResumeState` tokens; reconnecting with a token is an explicit application decision:
+- GoAI does not reconnect unless you ask: replaying a conversation could repeat tool side effects. Providers with `SessionResumption` (Gemini Live) report resume tokens once resumption is on. Resume an earlier session explicitly with `WithRealtimeResumption(token)`, or let the session switch connections itself:
 
 ```go
-goai.WithRealtimeProviderOptions(map[string]any{"google": map[string]any{
-    "sessionResumption":        map[string]any{"handle": lastResumeToken},
-    "contextWindowCompression": map[string]any{"slidingWindow": map[string]any{}},
-}})
+session, err := goai.OpenRealtimeSession(ctx, model,
+    goai.WithRealtimeAutoResume(3), // attempts in a row
+)
 ```
+
+  With auto-resume, a `RealtimeSessionGoAway` or a dropped connection moves the session to a new connection with the latest token; `Events()` stays open and a `RealtimeSessionResumed` event marks the switch (event `Sequence` numbers restart). Tools still running are cancelled, and input sent after the last token may be lost: GoAI does not replay it. Resumption keeps session state on the provider's servers, so leave it off when you need zero data retention.
 
 ## Security
 

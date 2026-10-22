@@ -359,3 +359,36 @@ func cmpOrEnv(key, fallback string) string {
 	}
 	return fallback
 }
+
+// TestE2E_LiveResumption resumes a closed session on a new connection with its
+// resume token and checks the model kept the conversation.
+func TestE2E_LiveResumption(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 90*time.Second)
+	defer cancel()
+	model := liveE2EModel(t)
+
+	first := liveE2ESession(t, ctx, model, goai.WithRealtimeResumption(""))
+	if err := first.SendText(ctx, "Remember this code word: zebra. Just say OK."); err != nil {
+		t.Fatal(err)
+	}
+	var token string
+	for ev := range first.Events() {
+		if ev.Type == provider.RealtimeSessionResumeState && ev.ResumeToken != "" {
+			token = ev.ResumeToken
+		}
+		if ev.Type == provider.RealtimeResponseFinished && !ev.Pending && token != "" {
+			break
+		}
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	second := liveE2ESession(t, ctx, model, goai.WithRealtimeResumption(token))
+	if err := second.SendText(ctx, "What was the code word? One word."); err != nil {
+		t.Fatal(err)
+	}
+	if transcript, _ := replyTranscript(t, second); !strings.Contains(strings.ToLower(transcript), "zebra") {
+		t.Fatalf("resumed session forgot the conversation: %q", transcript)
+	}
+}

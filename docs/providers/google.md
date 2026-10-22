@@ -214,7 +214,7 @@ session, err := goai.OpenRealtimeSession(ctx, model,
 - **Turns:** provider voice activity detection by default; `TurnModeClientVAD` sends `activityStart`/`activityEnd`. Manual commit and explicit response requests are not part of the Live API and return `provider.ErrRealtimeUnsupported`.
 - **Tools:** Gemini 3.8 Live runs functions without blocking by default. Set the behavior and result scheduling per tool with `google.LiveToolOptions(behavior, scheduling)` in `Tool.ProviderDefinedOptions`. Calls the model cancels arrive as `RealtimeToolCallCancelled`. There is no tool choice.
 - **Session settings:** `google.LiveConfig` types every setting of the official SDK's `LiveConnectConfig` (sampling, speech language, multi-speaker and cloned voices, translation, thinking, proactivity, resumption, context compression, avatar, safety, activity detection, and transcription tuning). Pass it with `goai.WithRealtimeProviderOptions(google.LiveProviderOptions(cfg))`. Any other setup field goes under `ProviderOptions["google"]` with its Live API name; the SDK-derived `model`, `systemInstruction`, and `tools` cannot be overridden. `transparent` resumption and `explicitVadSignal` are Vertex AI only.
-- **Lifecycle:** `RealtimeSessionGoAway` warns before the connection limit; `RealtimeSessionResumeState` carries the handle for reconnecting (empty while the session cannot be resumed).
+- **Lifecycle:** `RealtimeSessionGoAway` warns before the connection limit; with resumption on (`WithRealtimeResumption` or `WithRealtimeAutoResume`), `RealtimeSessionResumeState` carries the handle for reconnecting (empty while the session cannot be resumed).
 
 ```go
 cfg := google.LiveConfig{

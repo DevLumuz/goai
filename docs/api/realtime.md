@@ -58,6 +58,8 @@ After `Close` or a terminal error, sending returns `provider.ErrRealtimeSessionC
 | `WithRealtimeMaxOutputTokens(int)` | Response token limit. |
 | `WithRealtimeProviderOptions(map[string]any)` | Provider-specific session fields. |
 | `WithRealtimeRawEvents(bool)` | Also deliver every provider message as a `RealtimeProviderEvent`. |
+| `WithRealtimeResumption(token string)` | Enable session resumption; a non-empty token resumes that session. |
+| `WithRealtimeAutoResume(maxAttempts int)` | Switch to a new connection with the latest resume token on go-away or a dropped connection. |
 | `WithRealtimeEventBuffer(int)` | Size of the event queue (default 64). |
 | `WithRealtimeBackpressureTimeout(time.Duration)` | How long a full queue may wait before failing (default 1s). |
 | `WithRealtimeToolTimeout(time.Duration)` | Per-tool timeout (default 30s; ≤ 0 disables). |

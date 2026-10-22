@@ -268,6 +268,13 @@ func buildLiveSetup(modelName string, params provider.RealtimeParams, isVertex b
 	if si := buildSystemInstruction(params.System); si != nil {
 		setup["systemInstruction"] = si
 	}
+	if r := params.Resumption; r != nil {
+		resumption := map[string]any{}
+		if r.Token != "" {
+			resumption["handle"] = r.Token
+		}
+		setup["sessionResumption"] = resumption
+	}
 
 	toolChoice := params.ToolChoice
 	if toolChoice == "auto" {

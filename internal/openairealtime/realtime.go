@@ -193,6 +193,9 @@ func dialError(providerID string, err error, resp *http.Response) error {
 // buildSession maps RealtimeParams to the GA session object sent in
 // session.update, and returns the negotiated output audio format.
 func buildSession(params provider.RealtimeParams) (map[string]any, provider.AudioFormat, error) {
+	if params.Resumption != nil {
+		return nil, provider.AudioFormat{}, fmt.Errorf("%w: openai realtime has no session resumption", provider.ErrRealtimeUnsupported)
+	}
 	inFormat, err := wireFormat(params.InputAudio, "input")
 	if err != nil {
 		return nil, provider.AudioFormat{}, err

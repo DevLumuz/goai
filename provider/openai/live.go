@@ -289,6 +289,9 @@ func liveDialError(err error, resp *http.Response) error {
 // validateLiveParams rejects settings GPT-Live has no place for: the model
 // manages turns itself and its transcripts take no configuration.
 func validateLiveParams(params provider.RealtimeParams) error {
+	if params.Resumption != nil {
+		return fmt.Errorf("%w: GPT-Live has no session resumption; fork a stored session instead", provider.ErrRealtimeUnsupported)
+	}
 	td := params.TurnDetection
 	if (td.Mode != "" && td.Mode != provider.TurnModeProviderVAD) || td.DisableAutoResponse || td.DisableInterruption || len(td.ProviderOptions) > 0 {
 		return fmt.Errorf("%w: GPT-Live manages turns and interruptions itself", provider.ErrRealtimeUnsupported)

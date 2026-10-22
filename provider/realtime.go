@@ -127,7 +127,16 @@ type RealtimeParams struct {
 	// in addition to the normalized events. Without it, only messages and parts
 	// the adapter does not map arrive that way.
 	IncludeRawEvents bool
-	ProviderOptions  map[string]any
+	// Resumption enables session resumption: the provider reports resume
+	// tokens, and a Token resumes that earlier session. Nil leaves it off.
+	Resumption      *RealtimeResumption
+	ProviderOptions map[string]any
+}
+
+// RealtimeResumption enables session resumption; Token, when set, resumes the
+// session it came from.
+type RealtimeResumption struct {
+	Token string
 }
 
 // Validate checks provider-independent realtime configuration. Providers must
@@ -296,8 +305,11 @@ const (
 	RealtimeContextTruncated   RealtimeEventType = "context_truncated"
 	RealtimeSessionResumeState RealtimeEventType = "session_resume_state"
 	RealtimeSessionGoAway      RealtimeEventType = "session_go_away"
-	RealtimeDelegationCreated  RealtimeEventType = "delegation_created"
-	RealtimeError              RealtimeEventType = "error"
+	// RealtimeSessionResumed reports that the session moved to a new
+	// connection with automatic resumption.
+	RealtimeSessionResumed    RealtimeEventType = "session_resumed"
+	RealtimeDelegationCreated RealtimeEventType = "delegation_created"
+	RealtimeError             RealtimeEventType = "error"
 	// RealtimeReasoningDelta carries model reasoning text, not spoken output.
 	RealtimeReasoningDelta RealtimeEventType = "reasoning_delta"
 	// RealtimeSources reports the sources a response was grounded on.

@@ -30,6 +30,7 @@ type realtimeOptions struct {
 	maxParallelTools int
 	toolTimeout      time.Duration
 	sequentialTools  bool
+	autoResume       int
 	onEvent          []func(provider.RealtimeEvent)
 	onToolCallStart  []func(ToolCallStartInfo)
 	onToolCall       []func(ToolCallInfo)
@@ -103,6 +104,27 @@ func WithRealtimeMaxOutputTokens(n int) RealtimeOption {
 // provider.RealtimeProviderEvent in addition to the normalized events.
 func WithRealtimeRawEvents(enabled bool) RealtimeOption {
 	return func(o *realtimeOptions) { o.params.IncludeRawEvents = enabled }
+}
+
+// WithRealtimeResumption enables session resumption, so the provider reports
+// resume tokens; a non-empty token resumes that earlier session. Resumption
+// keeps session state on the provider's servers.
+func WithRealtimeResumption(token string) RealtimeOption {
+	return func(o *realtimeOptions) { o.params.Resumption = &provider.RealtimeResumption{Token: token} }
+}
+
+// WithRealtimeAutoResume moves the session to a new connection with the latest
+// resume token when the provider announces the end of the connection or the
+// connection drops, trying up to maxAttempts times in a row. It enables
+// resumption. Tools still running are cancelled, and input sent after the last
+// token may be lost; a RealtimeSessionResumed event marks the switch.
+func WithRealtimeAutoResume(maxAttempts int) RealtimeOption {
+	return func(o *realtimeOptions) {
+		o.autoResume = maxAttempts
+		if o.params.Resumption == nil {
+			o.params.Resumption = &provider.RealtimeResumption{}
+		}
+	}
 }
 
 // WithRealtimeProviderOptions sets experimental provider-specific session fields.
@@ -198,7 +220,16 @@ func WithRealtimeOnPanic(fn func(PanicInfo)) RealtimeOption {
 type RealtimeSession struct {
 	ctx    context.Context
 	cancel context.CancelFunc
-	conn   provider.RealtimeConnection
+
+	// connMu guards the connection, which automatic resumption replaces.
+	connMu     sync.RWMutex
+	conn       provider.RealtimeConnection
+	connClosed bool
+
+	model       provider.RealtimeModel
+	params      provider.RealtimeParams
+	autoResume  int
+	resumeToken string // consume goroutine only
 
 	events           chan provider.RealtimeEvent
 	done             chan struct{}
@@ -280,6 +311,9 @@ func OpenRealtimeSession(ctx context.Context, model provider.RealtimeModel, opts
 	if o.maxParallelTools < 1 {
 		return nil, fmt.Errorf("%w: max parallel tools must be positive", provider.ErrInvalidRealtimeConfig)
 	}
+	if o.autoResume < 0 {
+		return nil, fmt.Errorf("%w: auto-resume attempts cannot be negative", provider.ErrInvalidRealtimeConfig)
+	}
 
 	registry, err := newRealtimeTools(o.tools)
 	if err != nil {
@@ -309,6 +343,9 @@ func OpenRealtimeSession(ctx context.Context, model provider.RealtimeModel, opts
 		ctx:              sessionCtx,
 		cancel:           cancel,
 		conn:             conn,
+		model:            model,
+		params:           o.params,
+		autoResume:       o.autoResume,
 		events:           make(chan provider.RealtimeEvent, o.eventBuffer),
 		done:             make(chan struct{}),
 		backpressureWait: o.backpressureWait,
@@ -461,7 +498,11 @@ func (s *RealtimeSession) SendRaw(ctx context.Context, raw json.RawMessage) erro
 func (s *RealtimeSession) Close() error {
 	s.closeOnce.Do(func() {
 		s.cancel()
-		if err := s.conn.Close(); err != nil {
+		s.connMu.Lock()
+		conn := s.conn
+		s.connClosed = true
+		s.connMu.Unlock()
+		if err := conn.Close(); err != nil {
 			s.setErr(err)
 		}
 		s.cancelAllTools()
@@ -491,7 +532,13 @@ func (s *RealtimeSession) send(ctx context.Context, event provider.RealtimeClien
 		return provider.ErrRealtimeSessionClosed
 	default:
 	}
-	return s.conn.Send(ctx, cloneRealtimeClientEvent(event))
+	return s.connection().Send(ctx, cloneRealtimeClientEvent(event))
+}
+
+func (s *RealtimeSession) connection() provider.RealtimeConnection {
+	s.connMu.RLock()
+	defer s.connMu.RUnlock()
+	return s.conn
 }
 
 func (s *RealtimeSession) consume() {
@@ -499,26 +546,81 @@ func (s *RealtimeSession) consume() {
 	defer s.cancelAllTools()
 
 	for {
+		conn := s.connection()
 		select {
 		case <-s.ctx.Done():
 			return
-		case event, ok := <-s.conn.Events():
+		case event, ok := <-conn.Events():
 			if !ok {
-				if err := s.conn.Err(); err != nil {
+				err := conn.Err()
+				if err != nil && s.resume(conn) {
+					continue
+				}
+				if err != nil {
 					s.setErr(err)
 				}
 				return
 			}
 
 			event = cloneRealtimeEvent(event)
+			if event.Type == provider.RealtimeSessionResumeState && event.ResumeToken != "" {
+				s.resumeToken = event.ResumeToken
+			}
 			s.handleInternalEvent(event)
 			s.fireEventHooks(event)
 
 			if !s.publish(event) {
 				return
 			}
+			// Switching ahead of the announced end loses less than waiting for it.
+			if event.Type == provider.RealtimeSessionGoAway {
+				s.resume(conn)
+			}
 		}
 	}
+}
+
+// resume moves the session to a new connection opened with the latest resume
+// token, retrying with backoff up to the auto-resume limit. It reports false
+// when resumption is off, no token is known, or every attempt failed.
+func (s *RealtimeSession) resume(old provider.RealtimeConnection) bool {
+	if s.autoResume == 0 || s.resumeToken == "" {
+		return false
+	}
+	params := cloneRealtimeParams(s.params)
+	params.Resumption = &provider.RealtimeResumption{Token: s.resumeToken}
+	backoff := 250 * time.Millisecond
+	for attempt := 1; attempt <= s.autoResume; attempt++ {
+		if attempt > 1 {
+			timer := time.NewTimer(backoff)
+			select {
+			case <-timer.C:
+			case <-s.ctx.Done():
+				timer.Stop()
+				return false
+			}
+			backoff = min(backoff*2, 4*time.Second)
+		}
+		conn, err := s.model.OpenRealtime(s.ctx, params)
+		if err != nil || conn == nil {
+			continue
+		}
+		// Calls made on the old connection cannot be answered on the new one.
+		s.cancelAllTools()
+		s.connMu.Lock()
+		if s.connClosed {
+			s.connMu.Unlock()
+			_ = conn.Close()
+			return false
+		}
+		s.conn = conn
+		s.connMu.Unlock()
+		_ = old.Close()
+		resumed := provider.RealtimeEvent{Type: provider.RealtimeSessionResumed}
+		s.fireEventHooks(resumed)
+		return s.publish(resumed)
+	}
+	return false
 }
 
 // publish delivers event to the consumer. A full queue gets a bounded grace
@@ -542,7 +644,7 @@ func (s *RealtimeSession) publish(event provider.RealtimeEvent) bool {
 	case <-timer.C:
 		s.setErr(provider.ErrRealtimeBackpressure)
 		s.cancel()
-		_ = s.conn.Close()
+		_ = s.connection().Close()
 		return false
 	}
 }
@@ -571,6 +673,8 @@ func (s *RealtimeSession) handleInternalEvent(event provider.RealtimeEvent) {
 func (s *RealtimeSession) startTool(call provider.RealtimeToolCall, tools map[string]Tool) {
 	input := append(json.RawMessage(nil), call.Input...)
 	call.Input = input
+	// The result belongs to the connection that made the call.
+	conn := s.connection()
 
 	s.wg.Add(1)
 	go func() {
@@ -606,7 +710,7 @@ func (s *RealtimeSession) startTool(call provider.RealtimeToolCall, tools map[st
 
 		result := results[0]
 		output := encodeRealtimeToolOutput(result.Output, result.Error)
-		err := s.conn.Send(s.ctx, provider.RealtimeClientEvent{
+		err := conn.Send(s.ctx, provider.RealtimeClientEvent{
 			Type: provider.RealtimeToolResultEvent,
 			ToolResult: &provider.RealtimeToolResult{
 				ToolCallID: call.ID,
@@ -617,7 +721,7 @@ func (s *RealtimeSession) startTool(call provider.RealtimeToolCall, tools map[st
 		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, provider.ErrRealtimeSessionClosed) {
 			s.setErr(err)
 			s.cancel()
-			_ = s.conn.Close()
+			_ = conn.Close()
 		}
 	}()
 }
@@ -686,6 +790,10 @@ func (s *RealtimeSession) setErr(err error) {
 
 func cloneRealtimeParams(params provider.RealtimeParams) provider.RealtimeParams {
 	params.Tools = cloneToolDefinitions(params.Tools)
+	if params.Resumption != nil {
+		resumption := *params.Resumption
+		params.Resumption = &resumption
+	}
 	params.TurnDetection.ProviderOptions = cloneAnyMap(params.TurnDetection.ProviderOptions)
 	params.InputTranscription.ProviderOptions = cloneAnyMap(params.InputTranscription.ProviderOptions)
 	params.OutputTranscription.ProviderOptions = cloneAnyMap(params.OutputTranscription.ProviderOptions)

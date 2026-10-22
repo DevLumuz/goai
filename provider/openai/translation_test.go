@@ -278,3 +278,16 @@ func TestTranslationConnectionLost(t *testing.T) {
 	}
 	_ = conn.Close()
 }
+
+func TestResumptionUnsupportedOnOpenAI(t *testing.T) {
+	params := provider.RealtimeParams{Resumption: &provider.RealtimeResumption{}}
+	if _, err := buildTranslationSession(params); !errors.Is(err, provider.ErrRealtimeUnsupported) {
+		t.Errorf("translation: %v", err)
+	}
+	if err := validateLiveParams(params); !errors.Is(err, provider.ErrRealtimeUnsupported) {
+		t.Errorf("GPT-Live: %v", err)
+	}
+	if _, err := Realtime("m", WithAPIKey("k")).OpenRealtime(t.Context(), params); !errors.Is(err, provider.ErrRealtimeUnsupported) {
+		t.Errorf("Realtime: %v", err)
+	}
+}
