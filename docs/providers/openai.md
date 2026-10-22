@@ -201,6 +201,22 @@ session, err := goai.OpenRealtimeSession(ctx, openai.Live("gpt-live-1"),
 - **Not available:** manual turns, client activity signals, and explicit cancel or truncation (the model manages interruptions); transcripts are deltas (with their time span) without a final event. Creating WebRTC sessions (SDP exchange) and SIP call control (`accept`, `reject`, `refer`, `hangup`) are outside this WebSocket SDK.
 - **Usage:** `RealtimeUsageUpdated` carries the cumulative session time in `UsageDuration`. `Close` sends `session.close` and waits up to 15 seconds for the final usage.
 
+### Realtime Translation
+
+`Translation` opens a [realtime session](../concepts/realtime.md) with the realtime translation API (`wss://api.openai.com/v1/realtime/translations?model=...`), such as `gpt-realtime-translate`: it hears speech and speaks it in the target language. Experimental.
+
+```go
+session, err := goai.OpenRealtimeSession(ctx, openai.Translation("gpt-realtime-translate"),
+    goai.WithRealtimeInputTranscription(provider.TranscriptionConfig{Enabled: true}),  // source text
+    goai.WithRealtimeOutputTranscription(provider.TranscriptionConfig{Enabled: true}), // translated text
+    goai.WithRealtimeProviderOptions(openai.TranslationProviderOptions(openai.TranslationConfig{Language: "es"})),
+)
+```
+
+- **Audio:** stream 24 kHz mono PCM16 continuously, silence included; translated audio carries its own `AudioFormat`.
+- **Settings:** `TranslationConfig` sets the target language and noise reduction; `UpdateSession` with `TranslationProviderOptions` changes them mid-session. There are no instructions, voices, tools, or turns.
+- **Events:** transcripts and audio carry the stream alignment `elapsedMs` in `ProviderMetadata["openai"]`. `Close` sends `session.close` and waits for `session.closed`, so the last translated audio still arrives.
+
 ## API Routing
 
 All models use the Responses API (`/v1/responses`) by default. To force Chat Completions:
