@@ -16,10 +16,27 @@ type liveServerEvent struct {
 	Usage        *liveUsage          `json:"usage"`
 	Error        *liveWireError      `json:"error"`
 	Reason       string              `json:"reason"`
+	StartMs      int64               `json:"start_ms"`
+	EndMs        int64               `json:"end_ms"`
+	// ContextWindow is the share of the model's context in use.
+	ContextWindow *struct {
+		UsageRatio float64 `json:"usage_ratio"`
+	} `json:"context_window"`
 }
 
+// liveSessionInfo is the session resource of session.started: the server's
+// view of the delegation and audio, inherited by forks.
 type liveSessionInfo struct {
-	ID string `json:"id"`
+	ID         string `json:"id"`
+	Delegation *struct {
+		Type string `json:"type"`
+	} `json:"delegation"`
+	Audio *struct {
+		Format *struct {
+			Type string `json:"type"`
+			Rate int    `json:"rate"`
+		} `json:"format"`
+	} `json:"audio"`
 }
 
 type liveDelegationInfo struct {

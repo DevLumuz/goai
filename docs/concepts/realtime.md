@@ -180,6 +180,8 @@ The delegation mode is fixed when the session starts:
 
   Use `RealtimeContextThinking` for facts the model should know without saying them now, and `RealtimeContextInstructions` to steer the conversation. An empty `DelegationID` marks session-wide context, such as what the user sees on screen.
 
+- **Decisions delegation:** a model answers questions you configure (yes or no, a choice, or a score) about the conversation, for example to route a call; results arrive as raw `decision.*` events. See `openai.LiveConfig`.
+
 Because the model is full duplex, it handles turns and interruptions itself: there is no manual turn control or explicit cancel, transcripts arrive as deltas only, and no `RealtimeResponseFinished` marks the end of a spoken reply. Usage is billed by session time and arrives as `UsageDuration`; `Close` waits for the final usage before closing the connection.
 
 ## Event Reference

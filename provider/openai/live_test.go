@@ -433,7 +433,6 @@ func TestLive_SessionValidation(t *testing.T) {
 		{"transcription language", provider.RealtimeParams{InputTranscription: provider.TranscriptionConfig{Enabled: true, Language: "es"}}, provider.ErrRealtimeUnsupported},
 		{"tools without responses", provider.RealtimeParams{Tools: []provider.ToolDefinition{{Name: "t"}}}, provider.ErrRealtimeUnsupported},
 		{"responses without backend", provider.RealtimeParams{ProviderOptions: map[string]any{"delegation": map[string]any{"type": "responses"}}}, provider.ErrInvalidRealtimeConfig},
-		{"hosted tool def", provider.RealtimeParams{Tools: []provider.ToolDefinition{{Name: "w", ProviderDefinedType: "web_search"}}, ProviderOptions: LiveResponsesDelegation("m")}, provider.ErrRealtimeUnsupported},
 		{"bad schema", provider.RealtimeParams{Tools: []provider.ToolDefinition{{Name: "t", InputSchema: json.RawMessage(`{bad`)}}, ProviderOptions: LiveResponsesDelegation("m")}, provider.ErrInvalidRealtimeConfig},
 		{"override model", provider.RealtimeParams{ProviderOptions: map[string]any{"model": "x"}}, provider.ErrInvalidRealtimeConfig},
 		{"common validation", provider.RealtimeParams{MaxOutputTokens: -1}, provider.ErrInvalidRealtimeConfig},
@@ -580,7 +579,7 @@ func TestLive_Capabilities(t *testing.T) {
 	if !caps.Delegation || !caps.BargeIn || !caps.RawEvents || caps.ManualTurnControl || caps.OutputAudioTruncation || len(caps.SupportedInputAudio) != 4 {
 		t.Fatalf("capabilities = %+v", caps)
 	}
-	if got, _ := liveURL("https://api.openai.com/v1/"); got != "wss://api.openai.com/v1/live/sessions" {
+	if got, _ := liveURL("https://api.openai.com/v1/", "/live/sessions"); got != "wss://api.openai.com/v1/live/sessions" {
 		t.Fatalf("liveURL = %s", got)
 	}
 }

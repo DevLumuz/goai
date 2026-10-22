@@ -15,6 +15,7 @@ import (
 
 	goai "github.com/zendev-sh/goai"
 	"github.com/zendev-sh/goai/internal/jsonmerge"
+	"github.com/zendev-sh/goai/internal/openairealtime"
 	"github.com/zendev-sh/goai/internal/realtimews"
 	"github.com/zendev-sh/goai/provider"
 )
@@ -76,9 +77,40 @@ func Live(modelID string, opts ...Option) provider.RealtimeModel {
 	return &liveModel{id: modelID, opts: resolveConnectOptions(opts)}
 }
 
+// LiveFork starts a new session from a stored GPT-Live session over
+// WebSocket. It inherits the model, instructions, voice, and delegation;
+// ProviderOptions may set "store" and override the Responses backend, and the
+// audio format applies to the new connection only. ModelID reports the source
+// session ID.
+//
+// Experimental: see provider.RealtimeModel.
+func LiveFork(sourceSessionID string, opts ...Option) provider.RealtimeModel {
+	return &liveModel{id: sourceSessionID, opts: resolveConnectOptions(opts), mode: liveForkMode}
+}
+
+// LiveSideband attaches the backend to an existing GPT-Live session, such as
+// one whose audio runs over WebRTC or SIP, to observe and steer it: it
+// receives the session events and sends updates, context, and tool results,
+// but no audio. Attaching starts nothing; declare the session's audio format
+// with WithRealtimeAudio to label output audio. ModelID reports the session ID.
+//
+// Experimental: see provider.RealtimeModel.
+func LiveSideband(sessionID string, opts ...Option) provider.RealtimeModel {
+	return &liveModel{id: sessionID, opts: resolveConnectOptions(opts), mode: liveSidebandMode}
+}
+
+type liveMode int
+
+const (
+	livePrimaryMode liveMode = iota
+	liveForkMode
+	liveSidebandMode
+)
+
 type liveModel struct {
 	id   string
 	opts options
+	mode liveMode
 }
 
 func (m *liveModel) ModelID() string { return m.id }
@@ -88,16 +120,19 @@ func (m *liveModel) ModelID() string { return m.id }
 func (m *liveModel) RealtimeCapabilities() provider.RealtimeCapabilities {
 	formats := []provider.AudioFormat{livePCM24k, livePCM16k, livePCMU, livePCMA}
 	return provider.RealtimeCapabilities{
-		InputAudio:           true,
+		InputAudio:           m.mode != liveSidebandMode,
 		OutputAudio:          true,
 		InputTranscription:   true,
 		OutputTranscription:  true,
 		TextInput:            true,
+		ImageInput:           true,
 		ProviderVAD:          true,
 		BargeIn:              true,
 		FunctionCalling:      true,
 		NonBlockingToolCalls: true,
 		ParallelToolCalls:    true,
+		RuntimeSessionUpdate: true,
+		ConversationAppend:   true,
 		UsageUpdates:         true,
 		Delegation:           true,
 		RawEvents:            true,
@@ -106,13 +141,30 @@ func (m *liveModel) RealtimeCapabilities() provider.RealtimeCapabilities {
 	}
 }
 
-// OpenRealtime dials the Live endpoint, sends session.start, and returns once
-// the server reports session.started.
+// OpenRealtime dials the Live endpoint of the model's mode. A new session or
+// fork sends session.start and returns once the server reports
+// session.started; a sideband is ready as soon as it attaches.
 func (m *liveModel) OpenRealtime(ctx context.Context, params provider.RealtimeParams) (provider.RealtimeConnection, error) {
 	if err := params.Validate(); err != nil {
 		return nil, err
 	}
-	session, format, delegation, err := buildLiveSession(m.id, params)
+	var (
+		session    map[string]any
+		format     provider.AudioFormat
+		delegation string
+		path       = "/live/sessions"
+		err        error
+	)
+	switch m.mode {
+	case liveForkMode:
+		session, format, err = buildLiveForkSession(params)
+		path += "/" + url.PathEscape(m.id) + "/fork"
+	case liveSidebandMode:
+		format, err = liveSidebandFormat(params)
+		path += "/" + url.PathEscape(m.id) + "/attach"
+	default:
+		session, format, delegation, err = buildLiveSession(m.id, params)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -123,7 +175,7 @@ func (m *liveModel) OpenRealtime(ctx context.Context, params provider.RealtimePa
 	if err != nil {
 		return nil, fmt.Errorf("resolving auth token: %w", err)
 	}
-	endpoint, err := liveURL(m.opts.baseURL)
+	endpoint, err := liveURL(m.opts.baseURL, path)
 	if err != nil {
 		return nil, err
 	}
@@ -154,22 +206,58 @@ func (m *liveModel) OpenRealtime(ctx context.Context, params provider.RealtimePa
 		closed:     make(chan struct{}),
 		format:     format,
 		delegation: delegation,
+		sideband:   m.mode == liveSidebandMode,
 		inputTr:    params.InputTranscription.Enabled,
 		outputTr:   params.OutputTranscription.Enabled,
 		pending:    make(map[string]bool),
 		rawEvents:  params.IncludeRawEvents,
 	}
-	sessionID, err := c.start(ctx, session)
-	if err != nil {
-		c.abort()
-		return nil, err
+	sessionID := m.id
+	if m.mode != liveSidebandMode {
+		info, err := c.start(ctx, session)
+		if err != nil {
+			c.abort()
+			return nil, err
+		}
+		sessionID = c.adopt(info)
 	}
 	c.setup = append(c.setup, provider.RealtimeEvent{Type: provider.RealtimeSessionReady, SessionID: sessionID})
 	go c.readLoop()
 	return c, nil
 }
 
-func liveURL(base string) (string, error) {
+// adopt takes the delegation and audio format the server reports, which a
+// fork inherits from its source, and returns the session ID.
+func (c *liveConn) adopt(info *liveSessionInfo) string {
+	if info == nil {
+		return ""
+	}
+	if info.Delegation != nil && info.Delegation.Type != "" {
+		c.delegation = info.Delegation.Type
+	}
+	if info.Audio != nil && info.Audio.Format != nil {
+		if f, ok := liveFormatFromWire(info.Audio.Format.Type, info.Audio.Format.Rate); ok {
+			c.format = f
+		}
+	}
+	return info.ID
+}
+
+func liveFormatFromWire(typ string, rate int) (provider.AudioFormat, bool) {
+	switch {
+	case typ == "audio/pcm" && rate == 16_000:
+		return livePCM16k, true
+	case typ == "audio/pcm":
+		return livePCM24k, true
+	case typ == "audio/pcmu":
+		return livePCMU, true
+	case typ == "audio/pcma":
+		return livePCMA, true
+	}
+	return provider.AudioFormat{}, false
+}
+
+func liveURL(base, path string) (string, error) {
 	u, err := url.Parse(strings.TrimRight(base, "/"))
 	if err != nil {
 		return "", fmt.Errorf("openai: invalid base URL: %w", err)
@@ -182,7 +270,7 @@ func liveURL(base string) (string, error) {
 	default:
 		return "", fmt.Errorf("openai: unsupported base URL scheme %q for Live", u.Scheme)
 	}
-	u.Path += "/live/sessions"
+	u.Path += path
 	return u.String(), nil
 }
 
@@ -198,6 +286,26 @@ func liveDialError(err error, resp *http.Response) error {
 	return goai.ParseHTTPErrorWithHeaders("openai", resp.StatusCode, body, resp.Header)
 }
 
+// validateLiveParams rejects settings GPT-Live has no place for: the model
+// manages turns itself and its transcripts take no configuration.
+func validateLiveParams(params provider.RealtimeParams) error {
+	td := params.TurnDetection
+	if (td.Mode != "" && td.Mode != provider.TurnModeProviderVAD) || td.DisableAutoResponse || td.DisableInterruption || len(td.ProviderOptions) > 0 {
+		return fmt.Errorf("%w: GPT-Live manages turns and interruptions itself", provider.ErrRealtimeUnsupported)
+	}
+	for _, tc := range []provider.TranscriptionConfig{params.InputTranscription, params.OutputTranscription} {
+		if tc.Language != "" || tc.Prompt != "" || len(tc.ProviderOptions) > 0 {
+			return fmt.Errorf("%w: GPT-Live transcripts take no configuration", provider.ErrRealtimeUnsupported)
+		}
+	}
+	for key := range params.ProviderOptions {
+		if key == "model" || key == "instructions" {
+			return fmt.Errorf("%w: %s is derived from the realtime params", provider.ErrInvalidRealtimeConfig, key)
+		}
+	}
+	return nil
+}
+
 // buildLiveSession maps RealtimeParams to the session object of session.start.
 // It returns the shared audio format and the delegation type.
 func buildLiveSession(modelID string, params provider.RealtimeParams) (map[string]any, provider.AudioFormat, string, error) {
@@ -205,19 +313,8 @@ func buildLiveSession(modelID string, params provider.RealtimeParams) (map[strin
 	if err != nil {
 		return nil, provider.AudioFormat{}, "", err
 	}
-	td := params.TurnDetection
-	if (td.Mode != "" && td.Mode != provider.TurnModeProviderVAD) || td.DisableAutoResponse || td.DisableInterruption || len(td.ProviderOptions) > 0 {
-		return nil, provider.AudioFormat{}, "", fmt.Errorf("%w: GPT-Live manages turns and interruptions itself", provider.ErrRealtimeUnsupported)
-	}
-	for _, tc := range []provider.TranscriptionConfig{params.InputTranscription, params.OutputTranscription} {
-		if tc.Language != "" || tc.Prompt != "" || len(tc.ProviderOptions) > 0 {
-			return nil, provider.AudioFormat{}, "", fmt.Errorf("%w: GPT-Live transcripts take no configuration", provider.ErrRealtimeUnsupported)
-		}
-	}
-	for key := range params.ProviderOptions {
-		if key == "model" || key == "instructions" {
-			return nil, provider.AudioFormat{}, "", fmt.Errorf("%w: %s is derived from the realtime params", provider.ErrInvalidRealtimeConfig, key)
-		}
+	if err := validateLiveParams(params); err != nil {
+		return nil, provider.AudioFormat{}, "", err
 	}
 
 	audio := map[string]any{"format": wire}
@@ -233,41 +330,82 @@ func buildLiveSession(modelID string, params provider.RealtimeParams) (map[strin
 		session["instructions"] = params.System
 	}
 	session = jsonmerge.Deep(session, params.ProviderOptions)
+	if delegation, _ := session["delegation"].(map[string]any); delegation["type"] == "responses" && delegation["responses"] == nil {
+		return nil, provider.AudioFormat{}, "", fmt.Errorf("%w: responses delegation needs a backend model", provider.ErrInvalidRealtimeConfig)
+	}
+	session, kind, err := withLiveBackend(session, params)
+	return session, format, kind, err
+}
 
+// buildLiveForkSession builds the session.start of a fork: everything not set
+// is inherited from the stored session, which cannot change model,
+// instructions, or voice.
+func buildLiveForkSession(params provider.RealtimeParams) (map[string]any, provider.AudioFormat, error) {
+	if params.System != "" || params.Voice != "" {
+		return nil, provider.AudioFormat{}, fmt.Errorf("%w: a fork inherits the instructions and voice of its source", provider.ErrRealtimeUnsupported)
+	}
+	if err := validateLiveParams(params); err != nil {
+		return nil, provider.AudioFormat{}, err
+	}
+	session := map[string]any{}
+	var format provider.AudioFormat
+	if !params.InputAudio.IsZero() || !params.OutputAudio.IsZero() {
+		f, wire, err := liveFormat(params.InputAudio, params.OutputAudio)
+		if err != nil {
+			return nil, provider.AudioFormat{}, err
+		}
+		format = f
+		session["audio"] = map[string]any{"format": wire}
+	}
+	session = jsonmerge.Deep(session, params.ProviderOptions)
+	if len(params.Tools) > 0 || params.ToolChoice != "" || params.MaxOutputTokens > 0 {
+		// Backend overrides apply only to a source with Responses delegation.
+		session = jsonmerge.Deep(session, map[string]any{"delegation": map[string]any{"type": "responses"}})
+	}
+	session, _, err := withLiveBackend(session, params)
+	return session, format, err
+}
+
+// liveSidebandFormat is the format the application declares for the attached
+// session; the sideband carries no audio of its own.
+func liveSidebandFormat(params provider.RealtimeParams) (provider.AudioFormat, error) {
+	if params.System != "" || params.Voice != "" || len(params.Tools) > 0 || params.ToolChoice != "" ||
+		params.MaxOutputTokens > 0 || len(params.ProviderOptions) > 0 {
+		return provider.AudioFormat{}, fmt.Errorf("%w: a sideband attaches to a running session; change it with UpdateSession", provider.ErrRealtimeUnsupported)
+	}
+	if err := validateLiveParams(params); err != nil {
+		return provider.AudioFormat{}, err
+	}
+	if params.InputAudio.IsZero() && params.OutputAudio.IsZero() {
+		return provider.AudioFormat{}, nil
+	}
+	format, _, err := liveFormat(params.InputAudio, params.OutputAudio)
+	return format, err
+}
+
+// withLiveBackend adds tools, tool choice, and the token limit to the
+// Responses backend. Without Responses delegation there is no place for them.
+func withLiveBackend(session map[string]any, params provider.RealtimeParams) (map[string]any, string, error) {
 	delegation, _ := session["delegation"].(map[string]any)
 	kind, _ := delegation["type"].(string)
 	if kind != "responses" {
 		if len(params.Tools) > 0 || params.ToolChoice != "" || params.MaxOutputTokens > 0 {
-			return nil, provider.AudioFormat{}, "", fmt.Errorf("%w: GPT-Live runs tools on a Responses backend; use LiveResponsesDelegation", provider.ErrRealtimeUnsupported)
+			return nil, "", fmt.Errorf("%w: GPT-Live runs tools on a Responses backend; use LiveResponsesDelegation", provider.ErrRealtimeUnsupported)
 		}
-		return session, format, kind, nil
+		return session, kind, nil
 	}
-
 	responses, _ := delegation["responses"].(map[string]any)
-	if responses == nil {
-		return nil, provider.AudioFormat{}, "", fmt.Errorf("%w: responses delegation needs a backend model", provider.ErrInvalidRealtimeConfig)
-	}
 	backend := make(map[string]any, len(responses)+3)
 	for k, v := range responses {
 		backend[k] = v
 	}
 	if len(params.Tools) > 0 {
-		tools, _ := backend["tools"].([]any)
-		tools = append([]any(nil), tools...)
-		for _, def := range params.Tools {
-			if def.ProviderDefinedType != "" {
-				return nil, provider.AudioFormat{}, "", fmt.Errorf("%w: add hosted tool %s through delegation.responses.tools", provider.ErrRealtimeUnsupported, def.Name)
-			}
-			schema := json.RawMessage(`{"type":"object","properties":{}}`)
-			if len(def.InputSchema) > 0 {
-				if !json.Valid(def.InputSchema) {
-					return nil, provider.AudioFormat{}, "", fmt.Errorf("%w: invalid schema for tool %s", provider.ErrInvalidRealtimeConfig, def.Name)
-				}
-				schema = def.InputSchema
-			}
-			tools = append(tools, map[string]any{"type": "function", "name": def.Name, "description": def.Description, "parameters": schema})
+		existing, _ := backend["tools"].([]any)
+		tools, err := liveTools(params.Tools)
+		if err != nil {
+			return nil, "", err
 		}
-		backend["tools"] = tools
+		backend["tools"] = append(append([]any(nil), existing...), tools...)
 	}
 	if params.ToolChoice != "" {
 		backend["tool_choice"] = toolChoiceValue(params.ToolChoice)
@@ -276,7 +414,32 @@ func buildLiveSession(modelID string, params provider.RealtimeParams) (map[strin
 		backend["max_output_tokens"] = params.MaxOutputTokens
 	}
 	session["delegation"] = jsonmerge.Deep(delegation, map[string]any{"responses": backend})
-	return session, format, kind, nil
+	return session, kind, nil
+}
+
+// liveTools maps tools for the Responses backend: functions, and hosted tools
+// (web search, MCP, file search, and the rest) in the Responses API format.
+func liveTools(defs []provider.ToolDefinition) ([]any, error) {
+	tools := make([]any, 0, len(defs))
+	for _, def := range defs {
+		if def.ProviderDefinedType != "" {
+			tool := map[string]any{"type": def.ProviderDefinedType}
+			for k, v := range def.ProviderDefinedOptions {
+				tool[k] = v
+			}
+			tools = append(tools, tool)
+			continue
+		}
+		schema := json.RawMessage(`{"type":"object","properties":{}}`)
+		if len(def.InputSchema) > 0 {
+			if !json.Valid(def.InputSchema) {
+				return nil, fmt.Errorf("%w: invalid schema for tool %s", provider.ErrInvalidRealtimeConfig, def.Name)
+			}
+			schema = def.InputSchema
+		}
+		tools = append(tools, map[string]any{"type": "function", "name": def.Name, "description": def.Description, "parameters": schema})
+	}
+	return tools, nil
 }
 
 func toolChoiceValue(choice string) any {
@@ -328,7 +491,8 @@ type liveConn struct {
 	err   error
 
 	format     provider.AudioFormat
-	delegation string
+	delegation string // empty when unknown, as on a sideband
+	sideband   bool
 	inputTr    bool
 	outputTr   bool
 	rawEvents  bool
@@ -394,26 +558,23 @@ func (c *liveConn) abort() {
 	})
 }
 
-func (c *liveConn) start(ctx context.Context, session map[string]any) (string, error) {
+func (c *liveConn) start(ctx context.Context, session map[string]any) (*liveSessionInfo, error) {
 	if err := c.write(ctx, map[string]any{"type": "session.start", "session": session}); err != nil {
-		return "", fmt.Errorf("openai: sending session.start: %w", err)
+		return nil, fmt.Errorf("openai: sending session.start: %w", err)
 	}
 	for {
 		ev, data, err := c.read(ctx)
 		if err != nil {
-			return "", err
+			return nil, err
 		}
 		switch ev.Type {
 		case "session.started":
 			if c.rawEvents {
 				c.setup = append(c.setup, liveRawEvent(data))
 			}
-			if ev.Session != nil {
-				return ev.Session.ID, nil
-			}
-			return "", nil
+			return ev.Session, nil
 		case "error":
-			return "", liveError(ev.Error)
+			return nil, liveError(ev.Error)
 		}
 		c.setup = append(c.setup, c.translateMessage(ev, data)...)
 	}
@@ -533,10 +694,16 @@ func (c *liveConn) outputSent(callID string) bool {
 	return len(c.pending) == 0
 }
 
+// encode maps a client event by delegation: the Responses backend takes items
+// and response.create, the Decisions backend takes decision items and
+// decision.create, and with client delegation that work runs in the app. An
+// unknown delegation (a sideband) leaves the check to the server.
 func (c *liveConn) encode(event provider.RealtimeClientEvent) ([]map[string]any, error) {
-	responses := c.delegation == "responses"
 	switch event.Type {
 	case provider.RealtimeInputAudioAppend:
+		if c.sideband {
+			return nil, fmt.Errorf("%w: the session's audio runs on its own transport, not the sideband", provider.ErrRealtimeUnsupported)
+		}
 		if len(event.Audio) == 0 {
 			return nil, fmt.Errorf("%w: empty audio frame", provider.ErrInvalidRealtimeConfig)
 		}
@@ -544,38 +711,155 @@ func (c *liveConn) encode(event provider.RealtimeClientEvent) ([]map[string]any,
 	case provider.RealtimeContextAppend:
 		return c.encodeContext(event.Context)
 	case provider.RealtimeToolResultEvent:
-		result := event.ToolResult
-		if result == nil || result.ToolCallID == "" {
-			return nil, fmt.Errorf("%w: tool result needs a tool call ID", provider.ErrInvalidRealtimeConfig)
-		}
-		if !responses {
-			return nil, fmt.Errorf("%w: tool results need Responses delegation", provider.ErrRealtimeUnsupported)
-		}
-		return []map[string]any{{"type": "response.item.create", "item": map[string]any{
-			"type":    "function_call_output",
-			"call_id": result.ToolCallID,
-			"output":  string(result.Output),
-		}}}, nil
+		return c.encodeToolOutput(event.ToolResult)
 	case provider.RealtimeTextInput:
-		if !responses {
-			return nil, fmt.Errorf("%w: with client delegation, typed input goes to your own backend", provider.ErrRealtimeUnsupported)
+		return c.encodeUserInput(map[string]any{"type": "input_text", "text": event.Text}, true)
+	case provider.RealtimeImageInput:
+		media := event.Media
+		if media == nil || media.MIMEType == "" || len(media.Data) == 0 {
+			return nil, fmt.Errorf("%w: image input needs a MIME type and data", provider.ErrInvalidRealtimeConfig)
 		}
-		return []map[string]any{
-			{"type": "response.item.create", "item": map[string]any{
-				"type":    "message",
-				"role":    "user",
-				"content": []map[string]any{{"type": "input_text", "text": event.Text}},
-			}},
-			{"type": "response.create"},
-		}, nil
+		url := "data:" + media.MIMEType + ";base64," + base64.StdEncoding.EncodeToString(media.Data)
+		return c.encodeUserInput(map[string]any{"type": "input_image", "image_url": url}, false)
+	case provider.RealtimeConversationAppend:
+		return c.encodeConversation(event.Conversation)
+	case provider.RealtimeSessionUpdateEvent:
+		return c.encodeSessionUpdate(event.Update)
 	case provider.RealtimeResponseCreate:
-		if !responses {
-			return nil, fmt.Errorf("%w: response.create needs Responses delegation", provider.ErrRealtimeUnsupported)
+		if len(event.ProviderOptions) > 0 {
+			return nil, fmt.Errorf("%w: GPT-Live response.create takes no parameters", provider.ErrRealtimeUnsupported)
 		}
-		return []map[string]any{{"type": "response.create"}}, nil
+		create, err := c.backendCreate()
+		if err != nil {
+			return nil, err
+		}
+		return []map[string]any{create}, nil
 	default:
 		return nil, fmt.Errorf("%w: GPT-Live does not support %s", provider.ErrRealtimeUnsupported, event.Type)
 	}
+}
+
+// backendCreate asks the delegated backend to run now.
+func (c *liveConn) backendCreate() (map[string]any, error) {
+	switch c.delegation {
+	case "decisions":
+		return map[string]any{"type": "decision.create"}, nil
+	case "responses", "":
+		return map[string]any{"type": "response.create"}, nil
+	default:
+		return nil, fmt.Errorf("%w: with client delegation the backend is your own", provider.ErrRealtimeUnsupported)
+	}
+}
+
+// encodeUserInput adds one user content part to the backend; typed text also
+// asks the backend to respond, as typing a message would.
+func (c *liveConn) encodeUserInput(part map[string]any, respond bool) ([]map[string]any, error) {
+	item, err := c.backendItem(map[string]any{"type": "message", "role": "user", "content": []map[string]any{part}})
+	if err != nil {
+		return nil, err
+	}
+	msgs := []map[string]any{item}
+	if respond {
+		create, _ := c.backendCreate()
+		msgs = append(msgs, create)
+	}
+	return msgs, nil
+}
+
+// backendItem wraps an item for the delegated backend.
+func (c *liveConn) backendItem(item map[string]any) (map[string]any, error) {
+	switch c.delegation {
+	case "decisions":
+		if item["type"] != "message" || item["role"] != "user" {
+			return nil, fmt.Errorf("%w: the Decisions backend takes user messages only", provider.ErrInvalidRealtimeConfig)
+		}
+		return map[string]any{"type": "decision.item.create", "item": item}, nil
+	case "responses", "":
+		return map[string]any{"type": "response.item.create", "item": item}, nil
+	default:
+		return nil, fmt.Errorf("%w: with client delegation, input goes to your own backend", provider.ErrRealtimeUnsupported)
+	}
+}
+
+func (c *liveConn) encodeConversation(conv *provider.RealtimeConversation) ([]map[string]any, error) {
+	if conv == nil || len(conv.Messages) == 0 {
+		return nil, fmt.Errorf("%w: conversation needs messages", provider.ErrInvalidRealtimeConfig)
+	}
+	items, err := openairealtime.ConversationItems(conv.Messages)
+	if err != nil {
+		return nil, err
+	}
+	msgs := make([]map[string]any, 0, len(items)+1)
+	for _, item := range items {
+		msg, err := c.backendItem(item)
+		if err != nil {
+			return nil, err
+		}
+		msgs = append(msgs, msg)
+	}
+	if conv.RequestResponse {
+		create, _ := c.backendCreate()
+		msgs = append(msgs, create)
+	}
+	return msgs, nil
+}
+
+// encodeToolOutput answers a backend function call. The output is one text
+// value, so partial results and media have no place in it.
+func (c *liveConn) encodeToolOutput(result *provider.RealtimeToolResult) ([]map[string]any, error) {
+	if result == nil || result.ToolCallID == "" {
+		return nil, fmt.Errorf("%w: tool result needs a tool call ID", provider.ErrInvalidRealtimeConfig)
+	}
+	if c.delegation != "responses" && c.delegation != "" {
+		return nil, fmt.Errorf("%w: tool results need Responses delegation", provider.ErrRealtimeUnsupported)
+	}
+	if result.Partial || len(result.Media) > 0 {
+		return nil, fmt.Errorf("%w: GPT-Live tool outputs are a single text result", provider.ErrRealtimeUnsupported)
+	}
+	for key := range result.ProviderOptions {
+		if key == "type" || key == "call_id" {
+			return nil, fmt.Errorf("%w: %s is derived from the tool result", provider.ErrInvalidRealtimeConfig, key)
+		}
+	}
+	item := jsonmerge.Deep(map[string]any{
+		"type":    "function_call_output",
+		"call_id": result.ToolCallID,
+		"output":  string(result.Output),
+	}, result.ProviderOptions)
+	return []map[string]any{{"type": "response.item.create", "item": item}}, nil
+}
+
+// encodeSessionUpdate maps an update to session.update, which changes the
+// delegation backend and triggers; instructions are fixed at start and grow
+// through AppendContext.
+func (c *liveConn) encodeSessionUpdate(update *provider.RealtimeSessionUpdate) ([]map[string]any, error) {
+	if update == nil {
+		return nil, fmt.Errorf("%w: empty session update", provider.ErrInvalidRealtimeConfig)
+	}
+	if update.System != nil {
+		return nil, fmt.Errorf("%w: GPT-Live instructions are fixed; add more with AppendContext", provider.ErrRealtimeUnsupported)
+	}
+	session := map[string]any{}
+	if update.Tools != nil {
+		if c.delegation != "responses" && c.delegation != "" {
+			return nil, fmt.Errorf("%w: GPT-Live runs tools on a Responses backend", provider.ErrRealtimeUnsupported)
+		}
+		tools, err := liveTools(update.Tools)
+		if err != nil {
+			return nil, err
+		}
+		session["delegation"] = map[string]any{"type": "responses", "responses": map[string]any{"tools": tools}}
+	}
+	for key := range update.ProviderOptions {
+		if key == "model" || key == "instructions" {
+			return nil, fmt.Errorf("%w: %s cannot change after session start", provider.ErrInvalidRealtimeConfig, key)
+		}
+	}
+	session = jsonmerge.Deep(session, update.ProviderOptions)
+	if len(session) == 0 {
+		return nil, fmt.Errorf("%w: empty session update", provider.ErrInvalidRealtimeConfig)
+	}
+	return []map[string]any{{"type": "session.update", "session": session}}, nil
 }
 
 func (c *liveConn) encodeContext(content *provider.RealtimeContext) ([]map[string]any, error) {
@@ -668,12 +952,12 @@ func (c *liveConn) translate(ev liveServerEvent) ([]provider.RealtimeEvent, bool
 		if !c.inputTr {
 			return nil, true
 		}
-		return []provider.RealtimeEvent{{Type: provider.RealtimeInputTranscript, Text: ev.Delta}}, true
+		return []provider.RealtimeEvent{{Type: provider.RealtimeInputTranscript, Text: ev.Delta, AudioStart: liveMs(ev.StartMs), AudioEnd: liveMs(ev.EndMs)}}, true
 	case "session.output_transcript.delta":
 		if !c.outputTr {
 			return nil, true
 		}
-		return []provider.RealtimeEvent{{Type: provider.RealtimeOutputTranscript, Text: ev.Delta}}, true
+		return []provider.RealtimeEvent{{Type: provider.RealtimeOutputTranscript, Text: ev.Delta, AudioStart: liveMs(ev.StartMs), AudioEnd: liveMs(ev.EndMs)}}, true
 	case "session.delegation.created":
 		if ev.Delegation == nil {
 			return nil, false
@@ -694,7 +978,18 @@ func (c *liveConn) translate(ev liveServerEvent) ([]provider.RealtimeEvent, bool
 		if ev.Usage == nil {
 			return nil, true
 		}
-		return []provider.RealtimeEvent{{Type: provider.RealtimeUsageUpdated, UsageDuration: time.Duration(ev.Usage.Seconds * float64(time.Second))}}, true
+		usage := provider.RealtimeEvent{Type: provider.RealtimeUsageUpdated, UsageDuration: time.Duration(ev.Usage.Seconds * float64(time.Second))}
+		meta := map[string]any{}
+		if ev.ContextWindow != nil {
+			meta["contextWindowUsageRatio"] = ev.ContextWindow.UsageRatio
+		}
+		if ev.Reason != "" {
+			meta["closeReason"] = ev.Reason
+		}
+		if len(meta) > 0 {
+			usage.ProviderMetadata = map[string]any{"openai": meta}
+		}
+		return []provider.RealtimeEvent{usage}, true
 	case "error":
 		return []provider.RealtimeEvent{{Type: provider.RealtimeError, Error: liveError(ev.Error)}}, true
 	}
@@ -740,3 +1035,5 @@ func (c *liveConn) translateBackend(raw json.RawMessage) ([]provider.RealtimeEve
 	}
 	return nil, false
 }
+
+func liveMs(ms int64) time.Duration { return time.Duration(ms) * time.Millisecond }
