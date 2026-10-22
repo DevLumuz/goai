@@ -132,12 +132,12 @@ Models that see report `RealtimeCapabilities.ImageInput`. GoAI provides the chan
 session.InputImage(ctx, provider.RealtimeMedia{MIMEType: "image/jpeg", Data: jpegFrame})
 ```
 
-Video is a stream of such frames; send them at the rate the provider documents (about one per second for Gemini Live). Models that generate images or video, such as an avatar, report `OutputMedia` and emit `RealtimeOutputMedia` events with the encoded bytes in `ev.Media`.
+Video is a stream of such frames; send them at the rate the provider documents (about one per second for Gemini Live). Realtime frames carry no ordering guarantee against text, so for a still image a question refers to, put it in the history with `AppendConversation` instead. Models that generate images or video, such as an avatar, report `OutputMedia` and emit `RealtimeOutputMedia` events with the encoded bytes in `ev.Media`.
 
 ## Updating a Live Session
 
 - `AppendConversation` adds messages to the history, for example to restore an earlier conversation; `RequestResponse` asks the model to answer once they are in.
-- `UpdateSession` changes instructions, tools, or provider settings without reconnecting (`RuntimeSessionUpdate`). A nil field keeps its value; a non-nil empty `Tools` removes every tool. The session dispatches the new tools from then on.
+- `UpdateSession` changes instructions, tools, or provider settings without reconnecting, where `RuntimeSessionUpdate` is set (Gemini Live only on Vertex AI). A nil field keeps its value; a non-nil empty `Tools` removes every tool. The session dispatches the new tools from then on.
 - `EndInputAudio` tells the provider the microphone paused, so it can flush buffered audio (`InputAudioEnd`).
 
 ## Raw Provider Events

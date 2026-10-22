@@ -213,8 +213,39 @@ session, err := goai.OpenRealtimeSession(ctx, model,
 - **Vertex AI:** add `google.WithVertex(project, location)` with an OAuth `WithTokenSource`, or use [`vertex.Live`](vertex.md#realtime-voice-live-api).
 - **Turns:** provider voice activity detection by default; `TurnModeClientVAD` sends `activityStart`/`activityEnd`. Manual commit and explicit response requests are not part of the Live API and return `provider.ErrRealtimeUnsupported`.
 - **Tools:** Gemini 3.8 Live runs functions without blocking by default. Set the behavior and result scheduling per tool with `google.LiveToolOptions(behavior, scheduling)` in `Tool.ProviderDefinedOptions`. Calls the model cancels arrive as `RealtimeToolCallCancelled`. There is no tool choice.
-- **Session fields:** other setup fields go under `ProviderOptions["google"]` with their Live API names, for example `sessionResumption`, `contextWindowCompression`, `proactivity`, or `historyConfig`. The SDK-derived `model`, `systemInstruction`, and `tools` cannot be overridden.
-- **Lifecycle:** `RealtimeSessionGoAway` warns before the connection limit; with `sessionResumption` enabled, `RealtimeSessionResumeState` carries the handle for reconnecting.
+- **Session settings:** `google.LiveConfig` types every setting of the official SDK's `LiveConnectConfig` (sampling, speech language, multi-speaker and cloned voices, translation, thinking, proactivity, resumption, context compression, avatar, safety, activity detection, and transcription tuning). Pass it with `goai.WithRealtimeProviderOptions(google.LiveProviderOptions(cfg))`. Any other setup field goes under `ProviderOptions["google"]` with its Live API name; the SDK-derived `model`, `systemInstruction`, and `tools` cannot be overridden. `transparent` resumption and `explicitVadSignal` are Vertex AI only.
+- **Lifecycle:** `RealtimeSessionGoAway` warns before the connection limit; `RealtimeSessionResumeState` carries the handle for reconnecting (empty while the session cannot be resumed).
+
+```go
+cfg := google.LiveConfig{
+    LanguageCode:       "es-US",
+    ContextCompression: &google.LiveContextCompression{},
+    InputTranscription: &google.LiveTranscription{LanguageAuto: true, Mode: "VERBATIM"},
+}
+session, err := goai.OpenRealtimeSession(ctx, model, goai.WithRealtimeProviderOptions(google.LiveProviderOptions(cfg)))
+```
+
+#### Protocol Mapping
+
+| Live API | GoAI |
+| --- | --- |
+| `realtimeInput.audio` / `text` / `activityStart` / `activityEnd` | `InputAudio`, `SendText`, `StartInputActivity`, `EndInputActivity` |
+| `realtimeInput.video` | `InputImage` (encoded frames; no ordering guarantee against text) |
+| `realtimeInput.audioStreamEnd` | `EndInputAudio` (provider VAD only; new audio reopens the stream) |
+| `clientContent` | `AppendConversation` (ordered; `RequestResponse` sets `turnComplete`) |
+| `contextUpdate` | `UpdateSession`, Vertex AI only: the Gemini API ignores it, so it returns `ErrRealtimeUnsupported` |
+| `toolResponse` | tool results; `Partial` → `willContinue`, `Media` → `parts`, `ProviderOptions["google"]` merges into the response (for example `{"scheduling": "SILENT"}`) |
+| `setupComplete` | `RealtimeSessionReady` with `SessionID`; `voiceConsentSignature` in `ProviderMetadata["google"]` |
+| `modelTurn` parts | audio → `RealtimeOutputAudio`, text → `RealtimeTextDelta`, `thought` → `RealtimeReasoningDelta`, image/video → `RealtimeOutputMedia` |
+| `inputTranscription` / `outputTranscription` | transcript deltas with `Language`, `Speaker`, `AudioStart`/`AudioEnd` (`words` in `ProviderMetadata`); the final event on `finished` or at turn end |
+| `interimInputTranscription` | `RealtimeInputTranscript` with `IsInterim` |
+| `groundingMetadata` / `urlContextMetadata` | `RealtimeSources`; the full metadata, including search suggestions, in `ProviderMetadata["google"]` |
+| `waitingForInput` / `generationComplete` | `RealtimeWaitingForInput` / `RealtimeGenerationComplete` |
+| `turnComplete` + `turnCompleteReason` + `interactionStatus` | `RealtimeResponseFinished`; blocked input → `FinishContentFilter`, malformed call → `FinishError`; `IN_PROGRESS`/`REQUIRES_ACTION` → `Pending` |
+| `voiceActivity` / `voiceActivityDetectionSignal` | `RealtimeInputSpeechStarted` / `Stopped` with the audio offset |
+| `sessionResumptionUpdate` | `RealtimeSessionResumeState`; `lastConsumedClientMessageIndex` in `ProviderMetadata["google"]` |
+| `usageMetadata` | `RealtimeUsageUpdated` (tool-use prompt tokens count as input); per-modality details, `trafficType`, and `serviceTier` in `ProviderMetadata["google"]` |
+| function calls with streamed arguments (`partialArgs`, `willContinue`), anything else | `RealtimeProviderEvent` with the raw message |
 
 ## Options
 

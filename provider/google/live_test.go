@@ -331,6 +331,7 @@ func TestLive_ServerEvents(t *testing.T) {
 		provider.RealtimeResponseFinished,
 		provider.RealtimeSessionGoAway,
 		provider.RealtimeSessionResumeState,
+		provider.RealtimeSessionResumeState, // not resumable now: empty token
 		provider.RealtimeUsageUpdated,
 		provider.RealtimeUsageUpdated, // Vertex AI naming
 		provider.RealtimeError,
@@ -368,14 +369,17 @@ func TestLive_ServerEvents(t *testing.T) {
 	if ev := events[14]; ev.ResumeToken != "h1" {
 		t.Fatalf("resume token = %q", ev.ResumeToken)
 	}
+	if ev := events[15]; ev.ResumeToken != "" {
+		t.Fatalf("non-resumable update carries token %q", ev.ResumeToken)
+	}
 	wantUsage := provider.Usage{InputTokens: 60, CacheReadTokens: 40, OutputTokens: 20, ReasoningTokens: 5, TotalTokens: 125}
-	if ev := events[15]; ev.Usage != wantUsage {
+	if ev := events[16]; ev.Usage != wantUsage {
 		t.Fatalf("usage = %+v, want %+v", ev.Usage, wantUsage)
 	}
-	if ev := events[16]; ev.Usage.OutputTokens != 7 || ev.Usage.InputTokens != 10 {
+	if ev := events[17]; ev.Usage.OutputTokens != 7 || ev.Usage.InputTokens != 10 {
 		t.Fatalf("vertex usage = %+v", ev.Usage)
 	}
-	if ev := events[17]; ev.Error == nil || !strings.Contains(ev.Error.Error(), "RESOURCE_EXHAUSTED") {
+	if ev := events[18]; ev.Error == nil || !strings.Contains(ev.Error.Error(), "RESOURCE_EXHAUSTED") {
 		t.Fatalf("error event = %+v", ev)
 	}
 }
@@ -738,6 +742,14 @@ func FuzzLiveTranslate(f *testing.F) {
 		`{"goAway":{"timeLeft":"bogus"}}`,
 		`{"usageMetadata":{"promptTokenCount":-5}}`,
 		`{"voiceActivity":{"type":"ACTIVITY_START"}}`,
+		`{"voiceActivity":{"voiceActivityType":"ACTIVITY_END","audioOffset":"x"}}`,
+		`{"voiceActivityDetectionSignal":{"vadSignalType":"VAD_SIGNAL_TYPE_SOS"}}`,
+		`{"serverContent":{"inputTranscription":{"text":"a","finished":true,"startOffset":"1s"},"interimInputTranscription":{"text":"b"}}}`,
+		`{"serverContent":{"groundingMetadata":{"groundingChunks":[{"web":{}}]},"urlContextMetadata":{"urlMetadata":[{}]}}}`,
+		`{"serverContent":{"turnComplete":true,"turnCompleteReason":"BLOCKLIST","interactionStatus":"REQUIRES_ACTION"}}`,
+		`{"toolCall":{"functionCalls":[{"id":"1","name":"f","partialArgs":[]}]}}`,
+		`{"sessionResumptionUpdate":{"lastConsumedClientMessageIndex":"9"}}`,
+		`{"usageMetadata":{"promptTokensDetails":[{}],"candidatesTokensDetails":[{}]}}`,
 	} {
 		f.Add([]byte(seed))
 	}
@@ -748,7 +760,7 @@ func FuzzLiveTranslate(f *testing.F) {
 		}
 		c := &liveConn{calls: map[string]string{}}
 		_ = c.translateMessage(data, msg)
-		_ = c.finishTurn()
+		_ = c.finishTurn("", "")
 	})
 }
 

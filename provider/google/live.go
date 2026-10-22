@@ -10,7 +10,6 @@ import (
 	"net/url"
 	"strings"
 	"sync"
-	"time"
 
 	goai "github.com/zendev-sh/goai"
 	"github.com/zendev-sh/goai/internal/jsonmerge"
@@ -96,8 +95,9 @@ type liveModel struct {
 func (m *liveModel) ModelID() string { return m.id }
 
 // RealtimeCapabilities describes the Gemini 3.8 Live protocol: provider or
-// client activity detection, barge-in, blocking and non-blocking functions with
-// cancellation, session resumption, and context compression.
+// client activity detection, barge-in, image and video input, blocking and
+// non-blocking functions with cancellation, and resumption; on Vertex AI also
+// live session updates.
 func (m *liveModel) RealtimeCapabilities() provider.RealtimeCapabilities {
 	return provider.RealtimeCapabilities{
 		InputAudio:           true,
@@ -105,6 +105,7 @@ func (m *liveModel) RealtimeCapabilities() provider.RealtimeCapabilities {
 		InputTranscription:   true,
 		OutputTranscription:  true,
 		TextInput:            true,
+		ImageInput:           true,
 		ProviderVAD:          true,
 		ClientVAD:            true,
 		BargeIn:              true,
@@ -113,9 +114,14 @@ func (m *liveModel) RealtimeCapabilities() provider.RealtimeCapabilities {
 		NonBlockingToolCalls: true,
 		ParallelToolCalls:    true,
 		ToolCallCancellation: true,
+		RuntimeSessionUpdate: m.opts.isVertex,
 		SessionResumption:    true,
 		ContextCompression:   true,
 		UsageUpdates:         true,
+		OutputMedia:          true,
+		ConversationAppend:   true,
+		InputAudioEnd:        true,
+		PartialToolResults:   true,
 		RawEvents:            true,
 		SupportedInputAudio:  []provider.AudioFormat{liveInputFormat},
 		SupportedOutputAudio: []provider.AudioFormat{liveOutputFormat},
@@ -137,7 +143,7 @@ func (m *liveModel) OpenRealtime(ctx context.Context, params provider.RealtimePa
 	if err != nil {
 		return nil, err
 	}
-	setup, scheduling, err := buildLiveSetup(modelName, params)
+	setup, scheduling, err := buildLiveSetup(modelName, params, m.opts.isVertex)
 	if err != nil {
 		return nil, err
 	}
@@ -177,17 +183,19 @@ func (m *liveModel) OpenRealtime(ctx context.Context, params provider.RealtimePa
 		calls:          make(map[string]string),
 		scheduling:     scheduling,
 		clientActivity: params.TurnDetection.Mode == provider.TurnModeClientVAD,
+		vertex:         m.opts.isVertex,
 		rawEvents:      params.IncludeRawEvents,
 	}
 	if err := c.write(ctx, liveClientMessage{Setup: setup}); err != nil {
 		c.abort()
 		return nil, fmt.Errorf("google: sending live setup: %w", err)
 	}
-	if err := c.awaitSetup(ctx); err != nil {
+	setupComplete, err := c.awaitSetup(ctx)
+	if err != nil {
 		c.abort()
 		return nil, err
 	}
-	c.pending = append(c.pending, provider.RealtimeEvent{Type: provider.RealtimeSessionReady})
+	c.pending = append(c.pending, liveReadyEvent(setupComplete))
 	go c.readLoop()
 	return c, nil
 }
@@ -248,7 +256,7 @@ func liveDialError(err error, resp *http.Response) error {
 
 // buildLiveSetup maps RealtimeParams to the Live setup message. It also returns
 // the response scheduling configured per function name.
-func buildLiveSetup(modelName string, params provider.RealtimeParams) (map[string]any, map[string]string, error) {
+func buildLiveSetup(modelName string, params provider.RealtimeParams, isVertex bool) (map[string]any, map[string]string, error) {
 	if !params.InputAudio.IsZero() && params.InputAudio != liveInputFormat {
 		return nil, nil, fmt.Errorf("%w: gemini live input must be 16 kHz mono PCM16", provider.ErrUnsupportedAudioFormat)
 	}
@@ -310,7 +318,7 @@ func buildLiveSetup(modelName string, params provider.RealtimeParams) (map[strin
 		}
 	}
 
-	setup, err = mergeLiveProviderOptions(setup, params.ProviderOptions)
+	setup, err = mergeLiveProviderOptions(setup, params.ProviderOptions, isVertex)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -431,13 +439,22 @@ func buildLiveTranscription(cfg provider.TranscriptionConfig) (map[string]any, e
 
 // mergeLiveProviderOptions overlays ProviderOptions["google"] on the setup;
 // nested objects merge at every level. Fields the SDK derives from
-// RealtimeParams cannot be overridden.
-func mergeLiveProviderOptions(setup map[string]any, providerOptions map[string]any) (map[string]any, error) {
+// RealtimeParams cannot be overridden, and Vertex-only fields fail elsewhere.
+func mergeLiveProviderOptions(setup map[string]any, providerOptions map[string]any, isVertex bool) (map[string]any, error) {
 	gopts, _ := providerOptions["google"].(map[string]any)
 	for key := range gopts {
 		switch key {
 		case "model", "systemInstruction", "tools":
 			return nil, fmt.Errorf("%w: %s is derived from the realtime params", provider.ErrInvalidRealtimeConfig, key)
+		}
+	}
+	if !isVertex {
+		resumption, _ := gopts["sessionResumption"].(map[string]any)
+		if _, ok := resumption["transparent"]; ok {
+			return nil, fmt.Errorf("%w: transparent session resumption is Vertex AI only", provider.ErrRealtimeUnsupported)
+		}
+		if _, ok := gopts["explicitVadSignal"]; ok {
+			return nil, fmt.Errorf("%w: explicitVadSignal is Vertex AI only", provider.ErrRealtimeUnsupported)
 		}
 	}
 	return jsonmerge.Deep(setup, gopts), nil
@@ -464,6 +481,7 @@ type liveConn struct {
 	calls          map[string]string
 	scheduling     map[string]string
 	clientActivity bool
+	vertex         bool
 	rawEvents      bool
 
 	// Reader-goroutine state. pending holds events produced during setup,
@@ -474,8 +492,8 @@ type liveConn struct {
 	interrupted   bool
 	turnHadOutput bool
 	turnHadTools  bool
-	inputText     strings.Builder
-	outputText    strings.Builder
+
+	inputTranscript, outputTranscript liveTranscript
 }
 
 func (c *liveConn) Events() <-chan provider.RealtimeEvent { return c.events }
@@ -514,14 +532,16 @@ func (c *liveConn) Send(ctx context.Context, event provider.RealtimeClientEvent)
 		return provider.ErrRealtimeSessionClosed
 	}
 	var data []byte
+	var commit func()
 	if event.Type == provider.RealtimeRawEvent {
 		if !realtimews.IsJSONObject(event.Raw) {
 			return fmt.Errorf("%w: raw event must be a JSON object", provider.ErrInvalidRealtimeConfig)
 		}
 		data = event.Raw
 	} else {
-		msg, err := c.encode(event)
-		if err != nil {
+		var msg liveClientMessage
+		var err error
+		if msg, commit, err = c.encode(event); err != nil {
 			return err
 		}
 		if data, err = json.Marshal(msg); err != nil {
@@ -534,22 +554,38 @@ func (c *liveConn) Send(ctx context.Context, event provider.RealtimeClientEvent)
 		}
 		return fmt.Errorf("google: sending live message: %w", err)
 	}
+	if commit != nil {
+		commit()
+	}
 	return nil
 }
 
-func (c *liveConn) encode(event provider.RealtimeClientEvent) (liveClientMessage, error) {
+// encode maps a client event to a Live message. commit, when set, applies the
+// state change the message implies once it is written.
+func (c *liveConn) encode(event provider.RealtimeClientEvent) (msg liveClientMessage, commit func(), err error) {
 	switch event.Type {
 	case provider.RealtimeInputAudioAppend:
 		if len(event.Audio) == 0 {
-			return liveClientMessage{}, fmt.Errorf("%w: empty audio frame", provider.ErrInvalidRealtimeConfig)
+			return msg, nil, fmt.Errorf("%w: empty audio frame", provider.ErrInvalidRealtimeConfig)
 		}
 		return liveClientMessage{RealtimeInput: &liveRealtimeInput{Audio: &liveBlob{
 			MimeType: fmt.Sprintf("audio/pcm;rate=%d", liveInputSampleRate),
 			Data:     event.Audio,
-		}}}, nil
+		}}}, nil, nil
+	case provider.RealtimeImageInput:
+		media := event.Media
+		if media == nil || media.MIMEType == "" || len(media.Data) == 0 {
+			return msg, nil, fmt.Errorf("%w: image input needs a MIME type and data", provider.ErrInvalidRealtimeConfig)
+		}
+		return liveClientMessage{RealtimeInput: &liveRealtimeInput{Video: &liveBlob{MimeType: media.MIMEType, Data: media.Data}}}, nil, nil
+	case provider.RealtimeInputAudioEnd:
+		if c.clientActivity {
+			return msg, nil, fmt.Errorf("%w: audioStreamEnd needs automatic activity detection; use EndInputActivity", provider.ErrRealtimeUnsupported)
+		}
+		return liveClientMessage{RealtimeInput: &liveRealtimeInput{AudioStreamEnd: true}}, nil, nil
 	case provider.RealtimeInputActivityStart, provider.RealtimeInputActivityEnd:
 		if !c.clientActivity {
-			return liveClientMessage{}, fmt.Errorf("%w: activity signals require the client_vad turn mode", provider.ErrRealtimeUnsupported)
+			return msg, nil, fmt.Errorf("%w: activity signals require the client_vad turn mode", provider.ErrRealtimeUnsupported)
 		}
 		input := &liveRealtimeInput{}
 		if event.Type == provider.RealtimeInputActivityStart {
@@ -557,33 +593,135 @@ func (c *liveConn) encode(event provider.RealtimeClientEvent) (liveClientMessage
 		} else {
 			input.ActivityEnd = &struct{}{}
 		}
-		return liveClientMessage{RealtimeInput: input}, nil
+		return liveClientMessage{RealtimeInput: input}, nil, nil
 	case provider.RealtimeTextInput:
-		return liveClientMessage{RealtimeInput: &liveRealtimeInput{Text: event.Text}}, nil
+		return liveClientMessage{RealtimeInput: &liveRealtimeInput{Text: event.Text}}, nil, nil
+	case provider.RealtimeConversationAppend:
+		msg, err = encodeLiveConversation(event.Conversation)
+		return msg, nil, err
+	case provider.RealtimeSessionUpdateEvent:
+		// The Gemini API ignores contextUpdate; Vertex AI documents it for 3.8.
+		if !c.vertex {
+			return msg, nil, fmt.Errorf("%w: live session updates need Vertex AI", provider.ErrRealtimeUnsupported)
+		}
+		return c.encodeContextUpdate(event.Update)
 	case provider.RealtimeToolResultEvent:
 		return c.encodeToolResult(event.ToolResult)
 	default:
-		return liveClientMessage{}, fmt.Errorf("%w: gemini live does not support %s", provider.ErrRealtimeUnsupported, event.Type)
+		return msg, nil, fmt.Errorf("%w: gemini live does not support %s", provider.ErrRealtimeUnsupported, event.Type)
 	}
 }
 
-func (c *liveConn) encodeToolResult(result *provider.RealtimeToolResult) (liveClientMessage, error) {
+// encodeLiveConversation sends history as clientContent turns; turnComplete
+// asks the model to answer them.
+func encodeLiveConversation(conv *provider.RealtimeConversation) (liveClientMessage, error) {
+	if conv == nil || len(conv.Messages) == 0 {
+		return liveClientMessage{}, fmt.Errorf("%w: conversation needs messages", provider.ErrInvalidRealtimeConfig)
+	}
+	for _, m := range conv.Messages {
+		if m.Role == provider.RoleSystem {
+			return liveClientMessage{}, fmt.Errorf("%w: system messages go through a session update", provider.ErrInvalidRealtimeConfig)
+		}
+	}
+	turns := convertMessages(conv.Messages)
+	if len(turns) == 0 {
+		return liveClientMessage{}, fmt.Errorf("%w: conversation has no content gemini live accepts", provider.ErrInvalidRealtimeConfig)
+	}
+	return liveClientMessage{ClientContent: &liveClientContent{Turns: turns, TurnComplete: conv.RequestResponse}}, nil
+}
+
+// encodeContextUpdate maps a session update to contextUpdate. A tools update
+// replaces the response scheduling of each function once it is sent.
+func (c *liveConn) encodeContextUpdate(update *provider.RealtimeSessionUpdate) (liveClientMessage, func(), error) {
+	if update == nil {
+		return liveClientMessage{}, nil, fmt.Errorf("%w: empty session update", provider.ErrInvalidRealtimeConfig)
+	}
+	cu := map[string]any{}
+	if update.System != nil {
+		si := buildSystemInstruction(*update.System)
+		if si == nil {
+			si = map[string]any{"parts": []any{}}
+		}
+		cu["systemInstruction"] = si
+	}
+	var commit func()
+	if update.Tools != nil {
+		tools, scheduling, err := buildLiveTools(update.Tools)
+		if err != nil {
+			return liveClientMessage{}, nil, err
+		}
+		// The wrapper tells "no change" from "no tools": an empty wrapper clears them.
+		wrapper := map[string]any{}
+		if tools != nil {
+			wrapper["tools"] = tools
+		}
+		cu["tools"] = wrapper
+		commit = func() {
+			c.callsMu.Lock()
+			c.scheduling = scheduling
+			c.callsMu.Unlock()
+		}
+	}
+	gopts, _ := update.ProviderOptions["google"].(map[string]any)
+	for key := range gopts {
+		if key == "systemInstruction" || key == "tools" {
+			return liveClientMessage{}, nil, fmt.Errorf("%w: %s is derived from the session update", provider.ErrInvalidRealtimeConfig, key)
+		}
+	}
+	cu = jsonmerge.Deep(cu, gopts)
+	if len(cu) == 0 {
+		return liveClientMessage{}, nil, fmt.Errorf("%w: empty session update", provider.ErrInvalidRealtimeConfig)
+	}
+	return liveClientMessage{ContextUpdate: cu}, commit, nil
+}
+
+// encodeToolResult builds a functionResponse. Partial results keep the call
+// open (willContinue); ProviderOptions["google"] merges into the response, for
+// example to override its scheduling.
+func (c *liveConn) encodeToolResult(result *provider.RealtimeToolResult) (liveClientMessage, func(), error) {
 	if result == nil || result.ToolCallID == "" {
-		return liveClientMessage{}, fmt.Errorf("%w: tool result needs a tool call ID", provider.ErrInvalidRealtimeConfig)
+		return liveClientMessage{}, nil, fmt.Errorf("%w: tool result needs a tool call ID", provider.ErrInvalidRealtimeConfig)
 	}
 	c.callsMu.Lock()
 	name, ok := c.calls[result.ToolCallID]
-	delete(c.calls, result.ToolCallID)
+	scheduling := c.scheduling[name]
 	c.callsMu.Unlock()
 	if !ok {
-		return liveClientMessage{}, fmt.Errorf("%w: unknown tool call %q", provider.ErrInvalidRealtimeConfig, result.ToolCallID)
+		return liveClientMessage{}, nil, fmt.Errorf("%w: unknown tool call %q", provider.ErrInvalidRealtimeConfig, result.ToolCallID)
 	}
-	return liveClientMessage{ToolResponse: &liveToolResponse{FunctionResponses: []liveFunctionResponse{{
-		ID:         result.ToolCallID,
-		Name:       name,
-		Response:   liveResponseObject(result.Output),
-		Scheduling: c.scheduling[name],
-	}}}}, nil
+	response := map[string]any{
+		"id":       result.ToolCallID,
+		"name":     name,
+		"response": liveResponseObject(result.Output),
+	}
+	if scheduling != "" {
+		response["scheduling"] = scheduling
+	}
+	if result.Partial {
+		response["willContinue"] = true
+	}
+	if len(result.Media) > 0 {
+		parts := make([]map[string]any, 0, len(result.Media))
+		for _, m := range result.Media {
+			parts = append(parts, map[string]any{"inlineData": map[string]any{"mimeType": m.MIMEType, "data": m.Data}})
+		}
+		response["parts"] = parts
+	}
+	gopts, _ := result.ProviderOptions["google"].(map[string]any)
+	for key := range gopts {
+		if key == "id" || key == "name" {
+			return liveClientMessage{}, nil, fmt.Errorf("%w: %s is derived from the tool call", provider.ErrInvalidRealtimeConfig, key)
+		}
+	}
+	response = jsonmerge.Deep(response, gopts)
+	commit := func() {
+		if !result.Partial {
+			c.callsMu.Lock()
+			delete(c.calls, result.ToolCallID)
+			c.callsMu.Unlock()
+		}
+	}
+	return liveClientMessage{ToolResponse: &liveToolResponse{FunctionResponses: []map[string]any{response}}}, commit, nil
 }
 
 // liveResponseObject wraps non-object results: functionResponse.response must
@@ -609,27 +747,39 @@ func (c *liveConn) write(ctx context.Context, msg liveClientMessage) error {
 	return c.ws.Write(ctx, realtimews.MessageText, data)
 }
 
-func (c *liveConn) awaitSetup(ctx context.Context) error {
+// awaitSetup reads until setupComplete and returns it; earlier messages are
+// translated into the pending events.
+func (c *liveConn) awaitSetup(ctx context.Context) (*liveSetupComplete, error) {
 	for {
 		_, data, err := c.ws.Read(ctx)
 		if err != nil {
 			if closeErr := liveCloseError(err); closeErr != nil {
-				return closeErr
+				return nil, closeErr
 			}
-			return fmt.Errorf("google: waiting for live setup: %w", err)
+			return nil, fmt.Errorf("google: waiting for live setup: %w", err)
 		}
 		var msg liveServerMessage
 		if err := json.Unmarshal(data, &msg); err != nil {
-			return fmt.Errorf("google: decoding live message: %w", err)
+			return nil, fmt.Errorf("google: decoding live message: %w", err)
 		}
 		if msg.Error != nil {
-			return msg.Error.err()
+			return nil, msg.Error.err()
 		}
 		c.pending = append(c.pending, c.translateMessage(data, msg)...)
 		if msg.SetupComplete != nil {
-			return nil
+			return msg.SetupComplete, nil
 		}
 	}
+}
+
+// liveReadyEvent carries the session ID and, after a consent recording, the
+// signature that lets later sessions reuse the cloned voice.
+func liveReadyEvent(setup *liveSetupComplete) provider.RealtimeEvent {
+	ev := provider.RealtimeEvent{Type: provider.RealtimeSessionReady, SessionID: setup.SessionID}
+	if sig := setup.VoiceConsentSignature; sig != nil && sig.Signature != "" {
+		ev.ProviderMetadata = liveMetadata("voiceConsentSignature", sig.Signature)
+	}
+	return ev
 }
 
 func (c *liveConn) readLoop() {
@@ -691,11 +841,14 @@ func (c *liveConn) translateMessage(data []byte, msg liveServerMessage) []provid
 var (
 	liveMessageFields = map[string]bool{
 		"setupComplete": true, "serverContent": true, "toolCall": true, "toolCallCancellation": true,
-		"goAway": true, "sessionResumptionUpdate": true, "usageMetadata": true, "voiceActivity": true, "error": true,
+		"goAway": true, "sessionResumptionUpdate": true, "usageMetadata": true, "voiceActivity": true,
+		"voiceActivityDetectionSignal": true, "error": true,
 	}
 	liveServerContentFields = map[string]bool{
 		"modelTurn": true, "turnComplete": true, "generationComplete": true, "interrupted": true,
-		"inputTranscription": true, "outputTranscription": true,
+		"inputTranscription": true, "interimInputTranscription": true, "outputTranscription": true,
+		"groundingMetadata": true, "urlContextMetadata": true, "turnCompleteReason": true,
+		"waitingForInput": true, "interactionStatus": true,
 	}
 )
 
@@ -751,154 +904,4 @@ func (c *liveConn) setErr(err error) {
 		c.err = err
 	}
 	c.errMu.Unlock()
-}
-
-// translate maps one server message to common events and reports whether part
-// of it has no mapping. It runs only on the goroutine that owns the turn state:
-// the opener during setup, then the reader.
-func (c *liveConn) translate(msg liveServerMessage) (events []provider.RealtimeEvent, unmapped bool) {
-	startResponse := func() {
-		if !c.responding {
-			c.responding = true
-			events = append(events, provider.RealtimeEvent{Type: provider.RealtimeResponseStarted})
-		}
-	}
-
-	if msg.Error != nil {
-		events = append(events, provider.RealtimeEvent{Type: provider.RealtimeError, Error: msg.Error.err()})
-	}
-
-	if va := msg.VoiceActivity; va != nil {
-		switch va.Type {
-		case "ACTIVITY_START":
-			events = append(events, provider.RealtimeEvent{Type: provider.RealtimeInputSpeechStarted})
-		case "ACTIVITY_END":
-			events = append(events, provider.RealtimeEvent{Type: provider.RealtimeInputSpeechStopped})
-		default:
-			unmapped = true
-		}
-	}
-
-	if sc := msg.ServerContent; sc != nil {
-		if tr := sc.InputTranscription; tr != nil && tr.Text != "" {
-			c.inputText.WriteString(tr.Text)
-			events = append(events, provider.RealtimeEvent{Type: provider.RealtimeInputTranscript, Text: tr.Text})
-		}
-		if turn := sc.ModelTurn; turn != nil {
-			for _, part := range turn.Parts {
-				switch {
-				case part.Thought:
-					if part.Text != "" {
-						startResponse()
-						events = append(events, provider.RealtimeEvent{Type: provider.RealtimeReasoningDelta, Text: part.Text})
-					}
-				case part.InlineData != nil && strings.HasPrefix(part.InlineData.MimeType, "audio/"):
-					startResponse()
-					c.turnHadOutput = true
-					events = append(events, provider.RealtimeEvent{
-						Type:        provider.RealtimeOutputAudio,
-						Audio:       part.InlineData.Data,
-						AudioFormat: liveOutputFormat,
-					})
-				case part.Text != "":
-					startResponse()
-					c.turnHadOutput = true
-					events = append(events, provider.RealtimeEvent{Type: provider.RealtimeTextDelta, Text: part.Text})
-				default:
-					startResponse()
-					c.turnHadOutput = true
-					unmapped = true
-				}
-			}
-		}
-		if tr := sc.OutputTranscription; tr != nil && tr.Text != "" {
-			startResponse()
-			c.outputText.WriteString(tr.Text)
-			events = append(events, provider.RealtimeEvent{Type: provider.RealtimeOutputTranscript, Text: tr.Text})
-		}
-		if sc.Interrupted {
-			c.interrupted = true
-		}
-		if sc.GenerationComplete {
-			events = append(events, provider.RealtimeEvent{Type: provider.RealtimeGenerationComplete})
-		}
-		if sc.TurnComplete {
-			events = append(events, c.finishTurn()...)
-		}
-	}
-
-	if tc := msg.ToolCall; tc != nil {
-		for _, call := range tc.FunctionCalls {
-			startResponse()
-			c.turnHadTools = true
-			c.callsMu.Lock()
-			c.calls[call.ID] = call.Name
-			c.callsMu.Unlock()
-			input := call.Args
-			if len(input) == 0 {
-				input = json.RawMessage(`{}`)
-			}
-			events = append(events, provider.RealtimeEvent{
-				Type:       provider.RealtimeToolCallEvent,
-				ToolCallID: call.ID,
-				ToolCall:   &provider.RealtimeToolCall{ID: call.ID, Name: call.Name, Input: input},
-			})
-		}
-	}
-
-	if cancel := msg.ToolCallCancellation; cancel != nil {
-		for _, id := range cancel.IDs {
-			c.callsMu.Lock()
-			delete(c.calls, id)
-			c.callsMu.Unlock()
-			events = append(events, provider.RealtimeEvent{Type: provider.RealtimeToolCallCancelled, ToolCallID: id})
-		}
-	}
-
-	if ga := msg.GoAway; ga != nil {
-		left, _ := time.ParseDuration(ga.TimeLeft)
-		events = append(events, provider.RealtimeEvent{Type: provider.RealtimeSessionGoAway, TimeToClose: left})
-	}
-
-	if ru := msg.SessionResumptionUpdate; ru != nil && ru.Resumable && ru.NewHandle != "" {
-		events = append(events, provider.RealtimeEvent{Type: provider.RealtimeSessionResumeState, ResumeToken: ru.NewHandle})
-	}
-
-	if um := msg.UsageMetadata; um != nil {
-		usage := provider.Usage{
-			CacheReadTokens: um.CachedContentTokenCount,
-			InputTokens:     max(um.PromptTokenCount-um.CachedContentTokenCount, 0),
-			OutputTokens:    cmp.Or(um.ResponseTokenCount, um.CandidatesTokenCount),
-			ReasoningTokens: um.ThoughtsTokenCount,
-			TotalTokens:     um.TotalTokenCount,
-		}
-		events = append(events, provider.RealtimeEvent{Type: provider.RealtimeUsageUpdated, Usage: usage})
-	}
-	return events, unmapped
-}
-
-// finishTurn closes the current model turn: final transcripts, then the
-// response finish with the reason the turn ended.
-func (c *liveConn) finishTurn() []provider.RealtimeEvent {
-	var events []provider.RealtimeEvent
-	if c.inputText.Len() > 0 {
-		events = append(events, provider.RealtimeEvent{Type: provider.RealtimeInputTranscript, Text: c.inputText.String(), IsFinal: true})
-	}
-	if c.outputText.Len() > 0 {
-		events = append(events, provider.RealtimeEvent{Type: provider.RealtimeOutputTranscript, Text: c.outputText.String(), IsFinal: true})
-	}
-	if c.responding || c.interrupted {
-		reason := provider.FinishStop
-		switch {
-		case c.interrupted:
-			reason = provider.FinishInterrupted
-		case c.turnHadTools && !c.turnHadOutput:
-			reason = provider.FinishToolCalls
-		}
-		events = append(events, provider.RealtimeEvent{Type: provider.RealtimeResponseFinished, FinishReason: reason})
-	}
-	c.responding, c.interrupted, c.turnHadOutput, c.turnHadTools = false, false, false, false
-	c.inputText.Reset()
-	c.outputText.Reset()
-	return events
 }
