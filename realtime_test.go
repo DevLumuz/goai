@@ -1188,6 +1188,57 @@ func TestRealtimeSessionAutoResumeKeepsUpdates(t *testing.T) {
 	}
 }
 
+// failingResultConnection holds tool results until release, then fails them
+// the way a connection does while it closes.
+type failingResultConnection struct {
+	*fakeRealtimeConnection
+	sending chan struct{}
+	release chan struct{}
+}
+
+func (c *failingResultConnection) Send(ctx context.Context, event provider.RealtimeClientEvent) error {
+	if event.Type != provider.RealtimeToolResultEvent {
+		return c.fakeRealtimeConnection.Send(ctx, event)
+	}
+	close(c.sending)
+	<-c.release
+	return errors.New("write on a closing connection")
+}
+
+func TestRealtimeSessionResultOfReplacedConnection(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	first := &failingResultConnection{newFakeRealtimeConnection(8, 8), make(chan struct{}), make(chan struct{})}
+	second := newFakeRealtimeConnection(8, 8)
+	model := &resumingModel{conns: []provider.RealtimeConnection{first, second}}
+	session, err := OpenRealtimeSession(t.Context(), model, WithRealtimeAutoResume(1), WithRealtimeTools(echo("echo")))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	first.events <- provider.RealtimeEvent{Type: provider.RealtimeSessionResumeState, ResumeToken: "tok"}
+	first.events <- provider.RealtimeEvent{Type: provider.RealtimeToolCallEvent, ToolCall: &provider.RealtimeToolCall{ID: "c", Name: "echo", Input: json.RawMessage(`{}`)}}
+	_ = receiveRealtimeEvent(t, session.Events())
+	_ = receiveRealtimeEvent(t, session.Events())
+	<-first.sending
+	first.events <- provider.RealtimeEvent{Type: provider.RealtimeSessionGoAway}
+	_ = receiveRealtimeEvent(t, session.Events())
+	if ev := receiveRealtimeEvent(t, session.Events()); ev.Type != provider.RealtimeSessionResumed {
+		t.Fatalf("event = %+v", ev)
+	}
+	close(first.release)
+
+	if err := session.SendText(t.Context(), "still here"); err != nil {
+		t.Fatal(err)
+	}
+	if got := receiveRealtimeClientEvent(t, second.sent); got.Text != "still here" {
+		t.Fatalf("sent %+v", got)
+	}
+	if err := session.Close(); err != nil {
+		t.Fatalf("a result lost with the old connection ended the session: %v", err)
+	}
+}
+
 func TestRealtimeSessionResumeLimits(t *testing.T) {
 	defer goleak.VerifyNone(t)
 

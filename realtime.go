@@ -733,7 +733,9 @@ func (s *RealtimeSession) startTool(call provider.RealtimeToolCall, tools map[st
 				IsError:    result.IsError,
 			},
 		})
-		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, provider.ErrRealtimeSessionClosed) {
+		// A connection replaced by resumption may fail while it closes; the call
+		// went with it, so the session carries on.
+		if err != nil && s.connection() == conn && !errors.Is(err, context.Canceled) && !errors.Is(err, provider.ErrRealtimeSessionClosed) {
 			s.setErr(err)
 			s.cancel()
 			_ = conn.Close()
