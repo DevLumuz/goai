@@ -123,6 +123,8 @@ func TestLive_VertexOnlySetupFields(t *testing.T) {
 	for _, gopts := range []map[string]any{
 		{"sessionResumption": map[string]any{"transparent": true}},
 		{"explicitVadSignal": true},
+		{"safetySettings": []map[string]any{{"category": "HARM_CATEGORY_HARASSMENT", "method": "SEVERITY"}}},
+		{"safetySettings": []any{map[string]any{"method": "PROBABILITY"}}},
 	} {
 		opts := map[string]any{"google": gopts}
 		if _, err := mergeLiveProviderOptions(map[string]any{}, opts, false); !errors.Is(err, provider.ErrRealtimeUnsupported) {

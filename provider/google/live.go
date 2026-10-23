@@ -463,8 +463,31 @@ func mergeLiveProviderOptions(setup map[string]any, providerOptions map[string]a
 		if _, ok := gopts["explicitVadSignal"]; ok {
 			return nil, fmt.Errorf("%w: explicitVadSignal is Vertex AI only", provider.ErrRealtimeUnsupported)
 		}
+		if liveSafetyMethodSet(gopts["safetySettings"]) {
+			return nil, fmt.Errorf("%w: safety setting method is Vertex AI only", provider.ErrRealtimeUnsupported)
+		}
 	}
 	return jsonmerge.Deep(setup, gopts), nil
+}
+
+// liveSafetyMethodSet reports whether any safety setting sets a method, as
+// built by LiveProviderOptions or decoded from JSON.
+func liveSafetyMethodSet(settings any) bool {
+	var list []any
+	switch s := settings.(type) {
+	case []map[string]any:
+		for _, m := range s {
+			list = append(list, m)
+		}
+	case []any:
+		list = s
+	}
+	for _, item := range list {
+		if m, ok := item.(map[string]any); ok && m["method"] != nil {
+			return true
+		}
+	}
+	return false
 }
 
 // liveConn is one Live WebSocket session. A single reader goroutine translates

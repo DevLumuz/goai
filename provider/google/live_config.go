@@ -45,7 +45,8 @@ type LiveConfig struct {
 	ExplicitVADSignal bool
 	Avatar            *LiveAvatar
 	SafetySettings    []LiveSafetySetting
-	// Labels attach metadata to the session for billing. Vertex AI only.
+	// Labels attach user metadata to the session; Vertex AI also uses them
+	// for billing and reporting.
 	Labels map[string]string
 
 	ActivityDetection *LiveActivityDetection
