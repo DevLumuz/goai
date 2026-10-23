@@ -446,7 +446,8 @@ func buildLiveTranscription(cfg provider.TranscriptionConfig) (map[string]any, e
 
 // mergeLiveProviderOptions overlays ProviderOptions["google"] on the setup;
 // nested objects merge at every level. Fields the SDK derives from
-// RealtimeParams cannot be overridden, and Vertex-only fields fail elsewhere.
+// RealtimeParams cannot be overridden, and fields the backend does not accept
+// fail (see checkLiveBackend).
 func mergeLiveProviderOptions(setup map[string]any, providerOptions map[string]any, isVertex bool) (map[string]any, error) {
 	gopts, _ := providerOptions["google"].(map[string]any)
 	for key := range gopts {
@@ -455,39 +456,11 @@ func mergeLiveProviderOptions(setup map[string]any, providerOptions map[string]a
 			return nil, fmt.Errorf("%w: %s is derived from the realtime params", provider.ErrInvalidRealtimeConfig, key)
 		}
 	}
-	if !isVertex {
-		resumption, _ := gopts["sessionResumption"].(map[string]any)
-		if _, ok := resumption["transparent"]; ok {
-			return nil, fmt.Errorf("%w: transparent session resumption is Vertex AI only", provider.ErrRealtimeUnsupported)
-		}
-		if _, ok := gopts["explicitVadSignal"]; ok {
-			return nil, fmt.Errorf("%w: explicitVadSignal is Vertex AI only", provider.ErrRealtimeUnsupported)
-		}
-		if liveSafetyMethodSet(gopts["safetySettings"]) {
-			return nil, fmt.Errorf("%w: safety setting method is Vertex AI only", provider.ErrRealtimeUnsupported)
-		}
+	setup = jsonmerge.Deep(setup, gopts)
+	if err := checkLiveBackend(setup, isVertex); err != nil {
+		return nil, err
 	}
-	return jsonmerge.Deep(setup, gopts), nil
-}
-
-// liveSafetyMethodSet reports whether any safety setting sets a method, as
-// built by LiveProviderOptions or decoded from JSON.
-func liveSafetyMethodSet(settings any) bool {
-	var list []any
-	switch s := settings.(type) {
-	case []map[string]any:
-		for _, m := range s {
-			list = append(list, m)
-		}
-	case []any:
-		list = s
-	}
-	for _, item := range list {
-		if m, ok := item.(map[string]any); ok && m["method"] != nil {
-			return true
-		}
-	}
-	return false
+	return setup, nil
 }
 
 // liveConn is one Live WebSocket session. A single reader goroutine translates
@@ -699,6 +672,11 @@ func (c *liveConn) encodeContextUpdate(update *provider.RealtimeSessionUpdate) (
 		}
 	}
 	cu = jsonmerge.Deep(cu, gopts)
+	if wrapper, ok := cu["tools"].(map[string]any); ok {
+		if err := checkLiveBackend(map[string]any{"tools": wrapper["tools"]}, c.vertex); err != nil {
+			return liveClientMessage{}, nil, err
+		}
+	}
 	if len(cu) == 0 {
 		return liveClientMessage{}, nil, fmt.Errorf("%w: empty session update", provider.ErrInvalidRealtimeConfig)
 	}

@@ -213,7 +213,13 @@ session, err := goai.OpenRealtimeSession(ctx, model,
 - **Vertex AI:** add `google.WithVertex(project, location)` with an OAuth `WithTokenSource`, or use [`vertex.Live`](vertex.md#realtime-voice-live-api).
 - **Turns:** provider voice activity detection by default; `TurnModeClientVAD` sends `activityStart`/`activityEnd`. Manual commit and explicit response requests are not part of the Live API and return `provider.ErrRealtimeUnsupported`.
 - **Tools:** Gemini 3.8 Live runs functions without blocking by default. Set the behavior and result scheduling per tool with `google.LiveToolOptions(behavior, scheduling)` in `Tool.ProviderDefinedOptions`. Calls the model cancels arrive as `RealtimeToolCallCancelled`. There is no tool choice.
-- **Session settings:** `google.LiveConfig` types every setting of the official SDK's `LiveConnectConfig` (sampling, speech language, multi-speaker and cloned voices, translation, thinking, proactivity, resumption, context compression, avatar, safety, activity detection, and transcription tuning). Pass it with `goai.WithRealtimeProviderOptions(google.LiveProviderOptions(cfg))`. Any other setup field goes under `ProviderOptions["google"]` with its Live API name; the SDK-derived `model`, `systemInstruction`, and `tools` cannot be overridden. `transparent` resumption, `explicitVadSignal`, and the safety setting `method` are Vertex AI only: on the Gemini API they return `ErrRealtimeUnsupported` when the session opens.
+- **Session settings:** `google.LiveConfig` types every setting of the official SDK's `LiveConnectConfig` (sampling, speech language, cloned voices, translation, thinking, proactivity, resumption, context compression, avatar, safety, activity detection, and transcription tuning). Pass it with `goai.WithRealtimeProviderOptions(google.LiveProviderOptions(cfg))`. Any other setup field goes under `ProviderOptions["google"]` with its Live API name; the SDK-derived `model`, `systemInstruction`, and `tools` cannot be overridden. Each backend accepts only the fields the official SDK allows on it; anything else returns `ErrRealtimeUnsupported` before it is sent, with the constructor that supports it:
+
+  | Only on | Fields |
+  |---|---|
+  | Vertex AI (`vertex.Live`) | `transparent` resumption, `explicitVadSignal`, safety setting `method`, and the `retrieval`, `enterpriseWebSearch`, `parallelAiSearch`, `exaAiSearch` tools and the `googleSearch` options `excludeDomains` and `blockingConfidence` |
+  | Gemini API (`google.Live`) | cloned voice consent (`ConsentAudio`, `ConsentSignature`) and the `fileSearch` and `mcpServers` tools |
+  | Neither | `multiSpeakerVoiceConfig`, which the Live API does not support |
 - **Lifecycle:** `RealtimeSessionGoAway` warns before the connection limit; with resumption on (`WithRealtimeResumption` or `WithRealtimeAutoResume`), `RealtimeSessionResumeState` carries the handle for reconnecting (empty while the session cannot be resumed).
 
 ```go

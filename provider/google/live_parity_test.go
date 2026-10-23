@@ -43,7 +43,6 @@ func TestLiveProviderOptions(t *testing.T) {
 		Seed:                          ptr(7),
 		MediaResolution:               "MEDIA_RESOLUTION_LOW",
 		LanguageCode:                  "es-US",
-		SpeakerVoices:                 []LiveSpeakerVoice{{Speaker: "Ana", Voice: "Kore"}},
 		ReplicatedVoice:               &LiveReplicatedVoice{MIMEType: "audio/wav", Sample: []byte{1}, ConsentAudio: []byte{2}, ConsentSignature: "sig"},
 		Translation:                   &LiveTranslation{TargetLanguage: "fr", EchoTargetLanguage: ptr(false)},
 		Thinking:                      &LiveThinking{Budget: ptr(512), IncludeThoughts: true, Level: "LOW"},
@@ -71,7 +70,6 @@ func TestLiveProviderOptions(t *testing.T) {
 			"responseModalities":["TEXT"],"temperature":0.4,"topP":0.9,"topK":20,"seed":7,
 			"mediaResolution":"MEDIA_RESOLUTION_LOW","enableAffectiveDialog":true,
 			"speechConfig":{"languageCode":"es-US",
-				"multiSpeakerVoiceConfig":{"speakerVoiceConfigs":[{"speaker":"Ana","voiceConfig":{"prebuiltVoiceConfig":{"voiceName":"Kore"}}}]},
 				"voiceConfig":{"replicatedVoiceConfig":{"mimeType":"audio/wav","voiceSampleAudio":"AQ==","consentAudio":"Ag==","voiceConsentSignature":{"signature":"sig"}}}},
 			"thinkingConfig":{"thinkingBudget":512,"includeThoughts":true,"thinkingLevel":"LOW"},
 			"translationConfig":{"targetLanguageCode":"fr","echoTargetLanguage":false}},
@@ -119,19 +117,55 @@ func TestLive_LiveConfigMergesIntoSetup(t *testing.T) {
 		"inputAudioTranscription":{"languageCodes":["es"],"diarization":true}}`)
 }
 
-func TestLive_VertexOnlySetupFields(t *testing.T) {
-	for _, gopts := range []map[string]any{
-		{"sessionResumption": map[string]any{"transparent": true}},
-		{"explicitVadSignal": true},
-		{"safetySettings": []map[string]any{{"category": "HARM_CATEGORY_HARASSMENT", "method": "SEVERITY"}}},
-		{"safetySettings": []any{map[string]any{"method": "PROBABILITY"}}},
+func TestLive_BackendOnlyFields(t *testing.T) {
+	config := func(cfg LiveConfig) provider.RealtimeParams {
+		return provider.RealtimeParams{ProviderOptions: LiveProviderOptions(cfg)}
+	}
+	raw := func(gopts map[string]any) provider.RealtimeParams {
+		return provider.RealtimeParams{ProviderOptions: map[string]any{"google": gopts}}
+	}
+	tool := func(def provider.ToolDefinition) provider.RealtimeParams {
+		return provider.RealtimeParams{Tools: []provider.ToolDefinition{def}}
+	}
+	const vertexOnly, geminiOnly, both, neither = "vertex", "gemini", "both", "neither"
+	for name, c := range map[string]struct {
+		params provider.RealtimeParams
+		on     string
+	}{
+		"transparent resumption": {config(LiveConfig{SessionResumption: &LiveSessionResumption{Transparent: true}}), vertexOnly},
+		"explicit VAD signal":    {config(LiveConfig{ExplicitVADSignal: true}), vertexOnly},
+		"safety method":          {config(LiveConfig{SafetySettings: []LiveSafetySetting{{Category: "HARM_CATEGORY_HARASSMENT", Method: "SEVERITY"}}}), vertexOnly},
+		"raw safety method":      {raw(map[string]any{"safetySettings": []any{map[string]any{"method": "PROBABILITY"}}}), vertexOnly},
+		"enterprise web search":  {tool(provider.ToolDefinition{Name: "web", ProviderDefinedType: "google.enterprise_web_search"}), vertexOnly},
+		"retrieval":              {tool(provider.ToolDefinition{Name: "rag", ProviderDefinedType: "google.retrieval"}), vertexOnly},
+		"search exclude domains": {tool(provider.ToolDefinition{Name: "google_search", ProviderDefinedType: "google.google_search", ProviderDefinedOptions: map[string]any{"excludeDomains": []string{"a.com"}}}), vertexOnly},
+		"consent audio":          {config(LiveConfig{ReplicatedVoice: &LiveReplicatedVoice{MIMEType: "audio/wav", ConsentAudio: []byte{1}}}), geminiOnly},
+		"consent signature":      {config(LiveConfig{ReplicatedVoice: &LiveReplicatedVoice{ConsentSignature: "sig"}}), geminiOnly},
+		"file search":            {tool(Tools.FileSearch()), geminiOnly},
+		"MCP servers":            {tool(provider.ToolDefinition{Name: "mcp", ProviderDefinedType: "google.mcp_servers"}), geminiOnly},
+		"multi-speaker voices":   {raw(map[string]any{"generationConfig": map[string]any{"speechConfig": map[string]any{"multiSpeakerVoiceConfig": map[string]any{}}}}), neither},
+		"labels":                 {config(LiveConfig{Labels: map[string]string{"team": "voice"}}), both},
+		"replicated voice":       {config(LiveConfig{ReplicatedVoice: &LiveReplicatedVoice{MIMEType: "audio/wav", Sample: []byte{1}}}), both},
+		"google search":          {tool(Tools.GoogleSearch()), both},
 	} {
-		opts := map[string]any{"google": gopts}
-		if _, err := mergeLiveProviderOptions(map[string]any{}, opts, false); !errors.Is(err, provider.ErrRealtimeUnsupported) {
-			t.Errorf("Gemini API with %v: err = %v", gopts, err)
-		}
-		if _, err := mergeLiveProviderOptions(map[string]any{}, opts, true); err != nil {
-			t.Errorf("Vertex AI with %v: err = %v", gopts, err)
+		for _, vertex := range []bool{false, true} {
+			_, _, err := buildLiveSetup("m", c.params, vertex)
+			allowed := c.on == both || (vertex && c.on == vertexOnly) || (!vertex && c.on == geminiOnly)
+			if allowed {
+				if err != nil {
+					t.Errorf("%s (vertex=%v): err = %v", name, vertex, err)
+				}
+				continue
+			}
+			if !errors.Is(err, provider.ErrRealtimeUnsupported) {
+				t.Errorf("%s (vertex=%v): err = %v, want ErrRealtimeUnsupported", name, vertex, err)
+				continue
+			}
+			// The error names the constructor of the backend that supports it.
+			hint := map[string]string{vertexOnly: "vertex.Live", geminiOnly: "google.Live"}[c.on]
+			if hint != "" && !strings.Contains(err.Error(), hint) {
+				t.Errorf("%s (vertex=%v): error %q does not point to %s", name, vertex, err, hint)
+			}
 		}
 	}
 }
@@ -305,6 +339,10 @@ func TestLive_SessionUpdate(t *testing.T) {
 		if err := conn.Send(ctx, provider.RealtimeClientEvent{Type: provider.RealtimeSessionUpdateEvent, Update: bad}); !errors.Is(err, provider.ErrInvalidRealtimeConfig) {
 			t.Errorf("update %+v: err = %v", bad, err)
 		}
+	}
+	geminiOnlyTool := &provider.RealtimeSessionUpdate{Tools: []provider.ToolDefinition{Tools.FileSearch()}}
+	if err := conn.Send(ctx, provider.RealtimeClientEvent{Type: provider.RealtimeSessionUpdateEvent, Update: geminiOnlyTool}); !errors.Is(err, provider.ErrRealtimeUnsupported) {
+		t.Errorf("a Gemini API only tool on Vertex AI: err = %v", err)
 	}
 }
 

@@ -22,8 +22,6 @@ type LiveConfig struct {
 
 	// LanguageCode is the BCP-47 language of the generated speech.
 	LanguageCode string
-	// SpeakerVoices assigns a prebuilt voice to each named speaker.
-	SpeakerVoices []LiveSpeakerVoice
 	// ReplicatedVoice speaks with a cloned voice, verified by a consent recording.
 	ReplicatedVoice *LiveReplicatedVoice
 	Translation     *LiveTranslation
@@ -61,15 +59,10 @@ type LiveConfig struct {
 	OutputTranscription *LiveTranscription
 }
 
-// LiveSpeakerVoice is the prebuilt voice of one speaker in multi-speaker speech.
-type LiveSpeakerVoice struct {
-	Speaker string
-	Voice   string
-}
-
 // LiveReplicatedVoice clones a voice from a sample. The first session sends the
 // consent recording; later ones can reuse the signature from
 // RealtimeSessionReady.ProviderMetadata["google"]["voiceConsentSignature"].
+// ConsentAudio and ConsentSignature are Gemini API only.
 type LiveReplicatedVoice struct {
 	MIMEType         string
 	Sample           []byte
@@ -259,16 +252,6 @@ func LiveProviderOptions(cfg LiveConfig) map[string]any {
 func (cfg LiveConfig) speechConfig() map[string]any {
 	speech := map[string]any{}
 	putString(speech, "languageCode", cfg.LanguageCode)
-	if len(cfg.SpeakerVoices) > 0 {
-		voices := make([]map[string]any, 0, len(cfg.SpeakerVoices))
-		for _, v := range cfg.SpeakerVoices {
-			voices = append(voices, map[string]any{
-				"speaker":     v.Speaker,
-				"voiceConfig": map[string]any{"prebuiltVoiceConfig": map[string]any{"voiceName": v.Voice}},
-			})
-		}
-		speech["multiSpeakerVoiceConfig"] = map[string]any{"speakerVoiceConfigs": voices}
-	}
 	if r := cfg.ReplicatedVoice; r != nil {
 		replicated := map[string]any{}
 		putString(replicated, "mimeType", r.MIMEType)
