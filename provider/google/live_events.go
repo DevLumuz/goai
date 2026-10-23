@@ -361,12 +361,13 @@ func (c *liveConn) finishTurn(reason, status string) []provider.RealtimeEvent {
 	events = append(events, c.outputTranscript.finish(provider.RealtimeOutputTranscript)...)
 	// The interaction continues while a function runs or awaits a result.
 	pending := status == "IN_PROGRESS" || status == "REQUIRES_ACTION"
-	if !c.responding && !c.interrupted && (reason != "" || pending) {
-		// A turn without output still ends, blocked or pending: keep the pair.
+	if !c.responding && (c.interrupted || reason != "" || pending) {
+		// A turn without output still ends, interrupted, blocked, or pending:
+		// keep the pair.
 		c.responding = true
 		events = append(events, provider.RealtimeEvent{Type: provider.RealtimeResponseStarted})
 	}
-	if c.responding || c.interrupted {
+	if c.responding {
 		finish := provider.FinishStop
 		switch {
 		case c.interrupted:

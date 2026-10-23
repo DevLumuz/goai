@@ -551,6 +551,21 @@ func TestLive_PendingTurnWithoutOutput(t *testing.T) {
 	}
 }
 
+func TestLive_InterruptedTurnWithoutOutput(t *testing.T) {
+	c := &liveConn{calls: map[string]string{}}
+	var events []provider.RealtimeEvent
+	for _, raw := range []string{`{"serverContent":{"interrupted":true}}`, `{"serverContent":{"turnComplete":true}}`} {
+		var msg liveServerMessage
+		_ = json.Unmarshal([]byte(raw), &msg)
+		got, _ := c.translate(msg)
+		events = append(events, got...)
+	}
+	if len(events) != 2 || events[0].Type != provider.RealtimeResponseStarted ||
+		events[1].Type != provider.RealtimeResponseFinished || events[1].FinishReason != provider.FinishInterrupted {
+		t.Fatalf("events = %+v, want a started and interrupted pair", events)
+	}
+}
+
 func TestLive_ResumptionParam(t *testing.T) {
 	for token, want := range map[string]string{"": `{}`, "h1": `{"handle":"h1"}`} {
 		setup, _, err := buildLiveSetup("models/m", provider.RealtimeParams{Resumption: &provider.RealtimeResumption{Token: token}}, false)
