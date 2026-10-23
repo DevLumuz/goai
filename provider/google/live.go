@@ -603,9 +603,10 @@ func (c *liveConn) encode(event provider.RealtimeClientEvent) (msg liveClientMes
 		msg, err = encodeLiveConversation(event.Conversation)
 		return msg, nil, err
 	case provider.RealtimeSessionUpdateEvent:
-		// The Gemini API ignores contextUpdate; Vertex AI documents it for 3.8.
+		// contextUpdate exists only on Vertex AI for now; the Gemini API ignores it.
+		// If Google adds it there, drop this check and set RuntimeSessionUpdate always.
 		if !c.vertex {
-			return msg, nil, fmt.Errorf("%w: live session updates need Vertex AI", provider.ErrRealtimeUnsupported)
+			return msg, nil, fmt.Errorf("%w: live session updates are only supported on Vertex AI (vertex.Live)", provider.ErrRealtimeUnsupported)
 		}
 		return c.encodeContextUpdate(event.Update)
 	case provider.RealtimeToolResultEvent:
