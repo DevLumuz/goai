@@ -157,7 +157,7 @@ model := vertex.Live("gemini-3.8-live",
 session, err := goai.OpenRealtimeSession(ctx, model, goai.WithRealtimeTools(weatherTool))
 ```
 
-The session protocol, audio formats, and options are the same as on the Gemini API; see the [Google provider](google.md#realtime-voice-live-api). Vertex AI adds live session updates (`UpdateSession`, sent as `contextUpdate`), `transparent` session resumption, `explicitVadSignal`, the safety setting `method`, and some grounding tools; it does not accept cloned voice consent or the `fileSearch` and `mcpServers` tools. The [Google provider](google.md#realtime-voice-live-api) lists every field by backend; the others return `ErrRealtimeUnsupported` before they are sent. `WithBaseURL` replaces the endpoint host.
+The session protocol, audio formats, and options are the same as on the Gemini API; see the [Google provider](google.md#realtime-voice-live-api). Vertex AI adds live session updates (`UpdateSession`, sent as `contextUpdate`), `transparent` session resumption, `explicitVadSignal` (Google sends the signals only to allowlisted projects), the safety setting `method`, and some grounding tools; it does not accept cloned voice consent or the `fileSearch` and `mcpServers` tools. The [Google provider](google.md#realtime-voice-live-api) lists every field by backend; the others return `ErrRealtimeUnsupported` before they are sent. `WithBaseURL` replaces the endpoint host.
 
 ## Options
 

@@ -38,8 +38,8 @@ type LiveConfig struct {
 	// InitialHistoryInClientContent makes the server take conversation history
 	// (RealtimeSession.AppendConversation) before the realtime input starts.
 	InitialHistoryInClientContent bool
-	// ExplicitVADSignal asks the server for voiceActivityDetectionSignal
-	// messages. Vertex AI only.
+	// ExplicitVADSignal asks for voiceActivityDetectionSignal messages, which
+	// Google sends only to allowlisted projects. Vertex AI only.
 	ExplicitVADSignal bool
 	Avatar            *LiveAvatar
 	SafetySettings    []LiveSafetySetting
