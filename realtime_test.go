@@ -875,13 +875,15 @@ func TestRealtimeSessionRejectsDuplicateToolNames(t *testing.T) {
 	}
 }
 
+// echo is a tool that answers with its own name.
+func echo(name string) Tool {
+	return Tool{Name: name, Execute: func(context.Context, json.RawMessage) (string, error) { return `{"tool":"` + name + `"}`, nil }}
+}
+
 func TestRealtimeSessionUpdateSession(t *testing.T) {
 	defer goleak.VerifyNone(t)
 
 	conn := newFakeRealtimeConnection(8, 8)
-	echo := func(name string) Tool {
-		return Tool{Name: name, Execute: func(context.Context, json.RawMessage) (string, error) { return `{"tool":"` + name + `"}`, nil }}
-	}
 	session, err := OpenRealtimeSession(t.Context(), &fakeRealtimeModel{id: "test", conn: conn}, WithRealtimeTools(echo("old")))
 	if err != nil {
 		t.Fatal(err)
@@ -1150,6 +1152,36 @@ func TestRealtimeSessionAutoResumeOnDrop(t *testing.T) {
 	}
 	if n := len(model.opened()); n != 3 {
 		t.Fatalf("opens = %d, want 3", n)
+	}
+	if err := session.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRealtimeSessionAutoResumeKeepsUpdates(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	first, second := newFakeRealtimeConnection(8, 8), newFakeRealtimeConnection(8, 8)
+	model := &resumingModel{conns: []provider.RealtimeConnection{first, second}}
+	session, err := OpenRealtimeSession(t.Context(), model, WithRealtimeAutoResume(1),
+		WithRealtimeSystem("old"), WithRealtimeTools(echo("old")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	system := "new"
+	if err := session.UpdateSession(t.Context(), RealtimeUpdate{System: &system, Tools: []Tool{echo("new")}}); err != nil {
+		t.Fatal(err)
+	}
+	_ = receiveRealtimeClientEvent(t, first.sent)
+
+	first.events <- provider.RealtimeEvent{Type: provider.RealtimeSessionResumeState, ResumeToken: "tok"}
+	first.events <- provider.RealtimeEvent{Type: provider.RealtimeSessionGoAway}
+	for range 3 {
+		_ = receiveRealtimeEvent(t, session.Events())
+	}
+	p := model.opened()[1]
+	if p.System != "new" || len(p.Tools) != 1 || p.Tools[0].Name != "new" {
+		t.Fatalf("resumed with system %q and tools %+v, want the updated ones", p.System, p.Tools)
 	}
 	if err := session.Close(); err != nil {
 		t.Fatal(err)

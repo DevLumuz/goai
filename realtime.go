@@ -227,7 +227,7 @@ type RealtimeSession struct {
 	connClosed bool
 
 	model       provider.RealtimeModel
-	params      provider.RealtimeParams
+	params      provider.RealtimeParams // guarded by updateMu
 	autoResume  int
 	resumeToken string // consume goroutine only
 
@@ -241,8 +241,8 @@ type RealtimeSession struct {
 	errMu sync.RWMutex
 	err   error
 
-	// updateMu serializes UpdateSession so the tool registry matches the last
-	// update the provider received.
+	// updateMu serializes UpdateSession so the tool registry and params match
+	// the last update the provider received.
 	updateMu      sync.Mutex
 	tools         atomic.Pointer[realtimeTools]
 	toolHooks     toolHooks
@@ -455,29 +455,42 @@ func (s *RealtimeSession) AppendConversation(ctx context.Context, conversation p
 }
 
 // UpdateSession changes the instructions, tools, or provider settings of the
-// live session. New tools are dispatched like those given at open.
+// live session. New tools are dispatched like those given at open. Automatic
+// resumption reopens with the updated instructions and tools; the update's
+// ProviderOptions apply to this connection only.
 func (s *RealtimeSession) UpdateSession(ctx context.Context, update RealtimeUpdate) error {
 	wire := &provider.RealtimeSessionUpdate{System: update.System, ProviderOptions: update.ProviderOptions}
-	if update.Tools == nil {
-		return s.send(ctx, provider.RealtimeClientEvent{Type: provider.RealtimeSessionUpdateEvent, Update: wire})
-	}
-	registry, err := newRealtimeTools(update.Tools)
-	if err != nil {
-		return err
-	}
-	wire.Tools = ToolDefinitions(update.Tools)
-	if wire.Tools == nil {
-		wire.Tools = []provider.ToolDefinition{}
+	var registry *realtimeTools
+	if update.Tools != nil {
+		var err error
+		if registry, err = newRealtimeTools(update.Tools); err != nil {
+			return err
+		}
+		wire.Tools = ToolDefinitions(update.Tools)
+		if wire.Tools == nil {
+			wire.Tools = []provider.ToolDefinition{}
+		}
 	}
 
-	// The registry changes first: calls the provider makes after applying the
-	// update must find the new tools, and removed tools must stop running.
 	s.updateMu.Lock()
 	defer s.updateMu.Unlock()
-	previous := s.tools.Swap(registry)
+	// The registry changes first: calls the provider makes after applying the
+	// update must find the new tools, and removed tools must stop running.
+	var previous *realtimeTools
+	if registry != nil {
+		previous = s.tools.Swap(registry)
+	}
 	if err := s.send(ctx, provider.RealtimeClientEvent{Type: provider.RealtimeSessionUpdateEvent, Update: wire}); err != nil {
-		s.tools.Store(previous)
+		if previous != nil {
+			s.tools.Store(previous)
+		}
 		return err
+	}
+	if update.System != nil {
+		s.params.System = *update.System
+	}
+	if wire.Tools != nil {
+		s.params.Tools = cloneToolDefinitions(wire.Tools)
 	}
 	return nil
 }
@@ -587,7 +600,9 @@ func (s *RealtimeSession) resume(old provider.RealtimeConnection) bool {
 	if s.autoResume == 0 || s.resumeToken == "" {
 		return false
 	}
+	s.updateMu.Lock()
 	params := cloneRealtimeParams(s.params)
+	s.updateMu.Unlock()
 	params.Resumption = &provider.RealtimeResumption{Token: s.resumeToken}
 	backoff := 250 * time.Millisecond
 	for attempt := 1; attempt <= s.autoResume; attempt++ {

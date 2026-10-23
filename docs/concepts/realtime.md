@@ -223,7 +223,7 @@ session, err := goai.OpenRealtimeSession(ctx, model,
 )
 ```
 
-  With auto-resume, a `RealtimeSessionGoAway` or a dropped connection moves the session to a new connection with the latest token; `Events()` stays open and a `RealtimeSessionResumed` event marks the switch (event `Sequence` numbers restart). Tools still running are cancelled, and input sent after the last token may be lost: GoAI does not replay it. Resumption keeps session state on the provider's servers, so leave it off when you need zero data retention.
+  With auto-resume, a `RealtimeSessionGoAway` or a dropped connection moves the session to a new connection with the latest token; `Events()` stays open and a `RealtimeSessionResumed` event marks the switch (event `Sequence` numbers restart). The new connection opens with the instructions and tools of the last `UpdateSession`; the `ProviderOptions` of an update are not carried over. Tools still running are cancelled, and input sent after the last token may be lost: GoAI does not replay it. Resumption keeps session state on the provider's servers, so leave it off when you need zero data retention.
 
 ## Security
 
