@@ -3,6 +3,7 @@ package openairealtime
 import (
 	"encoding/base64"
 	"fmt"
+	"strings"
 
 	"github.com/zendev-sh/goai/internal/jsonmerge"
 	"github.com/zendev-sh/goai/provider"
@@ -34,8 +35,8 @@ func (c *conn) encode(event provider.RealtimeClientEvent) (msgs []clientEvent, r
 		return []clientEvent{msg}, nil, nil
 	case provider.RealtimeImageInput:
 		media := event.Media
-		if media == nil || media.MIMEType == "" || len(media.Data) == 0 {
-			return nil, nil, fmt.Errorf("%w: image input needs a MIME type and data", provider.ErrInvalidRealtimeConfig)
+		if media == nil || !strings.HasPrefix(media.MIMEType, "image/") || len(media.Data) == 0 {
+			return nil, nil, fmt.Errorf("%w: image input needs an image MIME type and data", provider.ErrInvalidRealtimeConfig)
 		}
 		return []clientEvent{itemCreate(map[string]any{
 			"type":    "message",

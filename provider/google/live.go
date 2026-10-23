@@ -577,8 +577,8 @@ func (c *liveConn) encode(event provider.RealtimeClientEvent) (msg liveClientMes
 		}}}, nil, nil
 	case provider.RealtimeImageInput:
 		media := event.Media
-		if media == nil || media.MIMEType == "" || len(media.Data) == 0 {
-			return msg, nil, fmt.Errorf("%w: image input needs a MIME type and data", provider.ErrInvalidRealtimeConfig)
+		if media == nil || !strings.HasPrefix(media.MIMEType, "image/") || len(media.Data) == 0 {
+			return msg, nil, fmt.Errorf("%w: image input needs an image MIME type and data", provider.ErrInvalidRealtimeConfig)
 		}
 		return liveClientMessage{RealtimeInput: &liveRealtimeInput{Video: &liveBlob{MimeType: media.MIMEType, Data: media.Data}}}, nil, nil
 	case provider.RealtimeInputAudioEnd:

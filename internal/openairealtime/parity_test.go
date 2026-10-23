@@ -139,6 +139,9 @@ func TestEncodeParityCommands(t *testing.T) {
 	if _, _, err := encode(provider.RealtimeClientEvent{Type: provider.RealtimeImageInput, Media: &provider.RealtimeMedia{MIMEType: "image/png"}}); !errors.Is(err, provider.ErrInvalidRealtimeConfig) {
 		t.Fatalf("empty image: %v", err)
 	}
+	if _, _, err := encode(provider.RealtimeClientEvent{Type: provider.RealtimeImageInput, Media: &provider.RealtimeMedia{MIMEType: "audio/wav", Data: []byte{1}}}); !errors.Is(err, provider.ErrInvalidRealtimeConfig) {
+		t.Fatalf("non-image media: %v", err)
+	}
 
 	conv := &provider.RealtimeConversation{RequestResponse: true, Messages: []provider.Message{
 		{Role: provider.RoleSystem, Content: []provider.Part{{Type: provider.PartText, Text: "Be kind."}}},

@@ -234,7 +234,7 @@ func TestLive_MediaAndAudioEndCommands(t *testing.T) {
 	}
 	jsonEqual(t, nextClientMessage(t, received), `{"realtimeInput":{"audioStreamEnd":true}}`)
 
-	for _, media := range []*provider.RealtimeMedia{nil, {MIMEType: "image/jpeg"}, {Data: []byte{1}}} {
+	for _, media := range []*provider.RealtimeMedia{nil, {MIMEType: "image/jpeg"}, {Data: []byte{1}}, {MIMEType: "video/mp4", Data: []byte{1}}} {
 		if err := conn.Send(ctx, provider.RealtimeClientEvent{Type: provider.RealtimeImageInput, Media: media}); !errors.Is(err, provider.ErrInvalidRealtimeConfig) {
 			t.Errorf("image %+v: err = %v", media, err)
 		}
