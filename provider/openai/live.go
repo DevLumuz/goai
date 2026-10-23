@@ -719,8 +719,8 @@ func (c *liveConn) encode(event provider.RealtimeClientEvent) ([]map[string]any,
 		return c.encodeUserInput(map[string]any{"type": "input_text", "text": event.Text}, true)
 	case provider.RealtimeImageInput:
 		media := event.Media
-		if media == nil || media.MIMEType == "" || len(media.Data) == 0 {
-			return nil, fmt.Errorf("%w: image input needs a MIME type and data", provider.ErrInvalidRealtimeConfig)
+		if media == nil || !strings.HasPrefix(media.MIMEType, "image/") || len(media.Data) == 0 {
+			return nil, fmt.Errorf("%w: image input needs an image MIME type and data", provider.ErrInvalidRealtimeConfig)
 		}
 		url := "data:" + media.MIMEType + ";base64," + base64.StdEncoding.EncodeToString(media.Data)
 		return c.encodeUserInput(map[string]any{"type": "input_image", "image_url": url}, false)

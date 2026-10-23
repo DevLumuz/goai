@@ -276,6 +276,7 @@ func TestLiveEncodeByDelegation(t *testing.T) {
 		{"decisions", provider.RealtimeClientEvent{Type: provider.RealtimeToolResultEvent, ToolResult: &provider.RealtimeToolResult{ToolCallID: "c"}}, provider.ErrRealtimeUnsupported},
 		{"responses", provider.RealtimeClientEvent{Type: provider.RealtimeResponseCreate, ProviderOptions: map[string]any{"x": 1}}, provider.ErrRealtimeUnsupported},
 		{"responses", provider.RealtimeClientEvent{Type: provider.RealtimeImageInput, Media: &provider.RealtimeMedia{MIMEType: "image/png"}}, provider.ErrInvalidRealtimeConfig},
+		{"responses", provider.RealtimeClientEvent{Type: provider.RealtimeImageInput, Media: &provider.RealtimeMedia{MIMEType: "video/mp4", Data: []byte{1}}}, provider.ErrInvalidRealtimeConfig},
 		{"responses", provider.RealtimeClientEvent{Type: provider.RealtimeConversationAppend}, provider.ErrInvalidRealtimeConfig},
 		{"responses", provider.RealtimeClientEvent{Type: provider.RealtimeConversationAppend, Conversation: &provider.RealtimeConversation{Messages: []provider.Message{{Role: provider.RoleUser}}}}, provider.ErrInvalidRealtimeConfig},
 		{"responses", provider.RealtimeClientEvent{Type: provider.RealtimeSessionUpdateEvent, Update: &provider.RealtimeSessionUpdate{System: &system}}, provider.ErrRealtimeUnsupported},
