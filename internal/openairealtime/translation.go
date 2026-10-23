@@ -125,12 +125,20 @@ func buildTranslationSession(params provider.RealtimeParams) (map[string]any, er
 		out.Language != "" || out.Prompt != "" || len(out.ProviderOptions) > 0 {
 		return nil, fmt.Errorf("%w: translation transcripts take only a model", provider.ErrRealtimeUnsupported)
 	}
-	session := map[string]any{}
-	if params.InputTranscription.Enabled {
-		model := DefaultTranscriptionModel
-		if m, ok := params.InputTranscription.ProviderOptions["model"].(string); ok && m != "" {
+	model := DefaultTranscriptionModel
+	for key, value := range params.InputTranscription.ProviderOptions {
+		m, ok := value.(string)
+		switch {
+		case key != "model":
+			return nil, fmt.Errorf("%w: translation transcripts take only a model", provider.ErrRealtimeUnsupported)
+		case !ok:
+			return nil, fmt.Errorf("%w: transcription model must be a string", provider.ErrInvalidRealtimeConfig)
+		case m != "":
 			model = m
 		}
+	}
+	session := map[string]any{}
+	if params.InputTranscription.Enabled {
 		session["audio"] = map[string]any{"input": map[string]any{"transcription": map[string]any{"model": model}}}
 	}
 	return jsonmerge.Deep(session, params.ProviderOptions), nil

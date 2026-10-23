@@ -215,6 +215,7 @@ session, err := goai.OpenRealtimeSession(ctx, openai.Translation("gpt-realtime-t
 
 - **Audio:** stream 24 kHz mono PCM16 continuously, silence included; translated audio carries its own `AudioFormat`.
 - **Settings:** `TranslationConfig` sets the target language and noise reduction; `UpdateSession` with `TranslationProviderOptions` changes them mid-session. There are no instructions, voices, tools, or turns.
+- **Transcription:** input transcription defaults to `gpt-live-transcribe`; `TranscriptionConfig.ProviderOptions["model"]` picks another model and is its only setting.
 - **Events:** transcripts and audio carry the stream alignment `elapsedMs` in `ProviderMetadata["openai"]`. `Close` sends `session.close` and waits for `session.closed`, so the last translated audio still arrives.
 
 ## API Routing

@@ -197,6 +197,8 @@ func TestTranslationValidation(t *testing.T) {
 		{provider.RealtimeParams{OutputAudio: pcm24k}, provider.ErrUnsupportedAudioFormat},
 		{provider.RealtimeParams{OutputTranscription: provider.TranscriptionConfig{Enabled: true, Language: "es"}}, provider.ErrRealtimeUnsupported},
 		{provider.RealtimeParams{MaxOutputTokens: -1}, provider.ErrInvalidRealtimeConfig},
+		{provider.RealtimeParams{InputTranscription: provider.TranscriptionConfig{Enabled: true, ProviderOptions: map[string]any{"noise_reduction": "x"}}}, provider.ErrRealtimeUnsupported},
+		{provider.RealtimeParams{InputTranscription: provider.TranscriptionConfig{Enabled: true, ProviderOptions: map[string]any{"model": 5}}}, provider.ErrInvalidRealtimeConfig},
 	} {
 		if _, err := model.OpenRealtime(t.Context(), c.params); !errors.Is(err, c.want) {
 			t.Errorf("%+v: err = %v, want %v", c.params, err, c.want)
