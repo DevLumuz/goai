@@ -189,11 +189,18 @@ func TestE2E_LivePendingInteraction(t *testing.T) {
 	if err := session.SendText(ctx, "What is 17 times 23? Answer in one sentence."); err != nil {
 		t.Fatal(err)
 	}
-	_, seen := replyTranscript(t, session)
-	var pending, raw bool
-	for _, ev := range seen {
-		pending = pending || ev.Type == provider.RealtimeResponseFinished && ev.Pending
+	// The first turn may end IN_PROGRESS and the server may never send a later
+	// one, so the first finished turn ends the wait.
+	var pending, raw, finished bool
+	for ev := range session.Events() {
 		raw = raw || ev.Type == provider.RealtimeProviderEvent
+		if ev.Type == provider.RealtimeResponseFinished {
+			pending, finished = ev.Pending, true
+			break
+		}
+	}
+	if !finished {
+		t.Fatalf("session ended before the response finished: %v", session.Err())
 	}
 	t.Logf("pending response seen: %v", pending)
 	if !raw {
