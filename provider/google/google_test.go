@@ -5020,3 +5020,73 @@ func TestChat_StreamText_MultiStepServerToolBeforeFunctionCall(t *testing.T) {
 		t.Fatalf("step2 model parts[3] = %#v, want toolResponse+sig-tr", p3)
 	}
 }
+
+func TestDecodeGoogleRawPart_VariantsAndFallbacks(t *testing.T) {
+	validJSON := `{"thoughtSignature":"sig-1","toolCall":{"id":"ws1","toolType":"GOOGLE_SEARCH_WEB"}}`
+	validCases := []struct {
+		name string
+		val  any
+	}{
+		{"map", map[string]any{"thoughtSignature": "sig-1", "toolCall": map[string]any{"id": "ws1"}}},
+		{"json.RawMessage", json.RawMessage(validJSON)},
+		{"bytes", []byte(validJSON)},
+		{"string", validJSON},
+	}
+	for _, tc := range validCases {
+		t.Run("valid/"+tc.name, func(t *testing.T) {
+			got, ok := decodeGoogleRawPart(tc.val)
+			if !ok || got["thoughtSignature"] != "sig-1" || got["toolCall"] == nil {
+				t.Fatalf("decodeGoogleRawPart(%s) = (%#v, %v), want valid map", tc.name, got, ok)
+			}
+		})
+	}
+
+	invalidCases := []struct {
+		name string
+		val  any
+	}{
+		{"nil", nil},
+		{"empty map", map[string]any{}},
+		{"empty raw", json.RawMessage(nil)},
+		{"invalid raw", json.RawMessage(`{`)},
+		{"empty json raw", json.RawMessage(`{}`)},
+		{"empty bytes", []byte(nil)},
+		{"invalid bytes", []byte(`{`)},
+		{"empty string", ""},
+		{"invalid string", "{"},
+		{"empty object string", "{}"},
+		{"unsupported type", 42},
+	}
+	for _, tc := range invalidCases {
+		t.Run("invalid/"+tc.name, func(t *testing.T) {
+			if got, ok := decodeGoogleRawPart(tc.val); ok || got != nil {
+				t.Fatalf("decodeGoogleRawPart(%s) = (%#v, %v), want (nil, false)", tc.name, got, ok)
+			}
+		})
+	}
+}
+
+func TestGeminiPart_RawJSONFallbackAndUnmarshalError(t *testing.T) {
+	var bad geminiPart
+	if err := json.Unmarshal([]byte(`{"text":123}`), &bad); err == nil {
+		t.Fatal("expected UnmarshalJSON error for wrong field type")
+	}
+
+	direct := geminiPart{ThoughtSignature: "sig-direct"}
+	raw := direct.rawJSON()
+	if !strings.Contains(string(raw), `"thoughtSignature":"sig-direct"`) {
+		t.Fatalf("rawJSON() = %s, want marshaled thoughtSignature", raw)
+	}
+	_, _, _, meta, ok := direct.serverSidePart()
+	if !ok || meta["providerExecuted"] != true {
+		t.Fatalf("serverSidePart() on direct struct = (%#v, %v), want ok", meta, ok)
+	}
+}
+
+func TestParseSSE_CancelOnServerSidePart(t *testing.T) {
+	input := "data: " + `{"candidates":[{"content":{"parts":[{"thoughtSignature":"sig-tc","toolCall":{"id":"ws1","toolType":"GOOGLE_SEARCH_WEB","args":{"queries":["q"]}}}]}}]}` + "\n\n"
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	out := make(chan provider.StreamChunk)
+	parseSSE(ctx, strings.NewReader(input), out)
+}
