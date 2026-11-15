@@ -5081,6 +5081,14 @@ func TestGeminiPart_RawJSONFallbackAndUnmarshalError(t *testing.T) {
 	if !ok || meta["providerExecuted"] != true {
 		t.Fatalf("serverSidePart() on direct struct = (%#v, %v), want ok", meta, ok)
 	}
+
+	unmarshalable := geminiPart{ToolCall: json.RawMessage(`{invalid`)}
+	if raw := unmarshalable.rawJSON(); raw != nil {
+		t.Fatalf("rawJSON() on invalid ToolCall = %s, want nil", raw)
+	}
+	if _, _, _, _, ok := unmarshalable.serverSidePart(); ok {
+		t.Fatal("serverSidePart() on invalid ToolCall should return false")
+	}
 }
 
 func TestParseSSE_CancelOnServerSidePart(t *testing.T) {
